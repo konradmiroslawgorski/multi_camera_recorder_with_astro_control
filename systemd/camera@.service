@@ -1,0 +1,22 @@
+[Unit]
+Description=Camera Recorder %i
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+KillMode=control-group
+LimitNOFILE=65536
+
+EnvironmentFile=/home/ubuntu/projects/mcrwac/config/camera_%i.env
+
+ExecStartPre=/bin/sh -c 'mkdir -p /opt/cameras/recordings/%i/$(date +%%Y-%%m-%%d)'
+
+ExecStart=/usr/bin/ffmpeg -hide_banner -loglevel error -fflags +genpts -rtsp_transport tcp -stimeout 5000000 -i ${RTSP_URL} -c copy -f segment -segment_time ${SEGMENT_TIME} -reset_timestamps 1 -strftime 1 /opt/cameras/recordings/%i/%%Y-%%m-%%d/%%H-%%M-%%S.mkv
+
+[Install]
+WantedBy=multi-user.target
