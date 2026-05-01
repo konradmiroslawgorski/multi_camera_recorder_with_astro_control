@@ -1,0 +1,45 @@
+default:
+  canvas:
+    width: 300
+    height: 300
+
+  overlay:
+    font_size: 24
+    show_time: true
+    box: true
+
+  processing:
+    video_codec: libx264
+    crf: 18
+    preset: veryfast
+    copy_audio: true
+
+  time_window:
+    start_second: 0
+    end_second: null
+
+
+cameras:
+
+  POE_BRAMA:
+    roi:
+      left: 315
+      top: 1490
+      width: 40
+      height: 40
+
+    time_window:
+      start_second: 0
+      end_second: 300
+
+
+  POE1:
+    roi:
+      left: 100
+      top: 1200
+      width: 50
+      height: 80
+
+    time_window:
+      start_second: 0
+      end_second: null

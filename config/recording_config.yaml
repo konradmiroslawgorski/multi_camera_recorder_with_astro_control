@@ -1,0 +1,11 @@
+location:
+  latitude: 52.2297
+  longitude: 21.0122
+  timezone: Europe/Warsaw
+
+recording_window:
+  start: "sunrise - 1h"
+  stop:  "sunset + 2h"
+
+segment:
+  duration_minutes: 15
