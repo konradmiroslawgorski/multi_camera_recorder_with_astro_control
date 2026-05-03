@@ -70,7 +70,7 @@ def build_time_offset_seconds(filename: str) -> int:
     return h * 3600 + m * 60 + s
 
 
-def run_ffmpeg_analysis(input_file, output_file, roi, canvas, overlay, processing, time_window):
+def run_ffmpeg_analysis(input_file, output_file, roi, canvas, overlay, time_window):
 
     offset = build_time_offset_seconds(input_file.name)
 
@@ -82,6 +82,7 @@ def run_ffmpeg_analysis(input_file, output_file, roi, canvas, overlay, processin
 
     vf = (
         f"crop={roi['width']}:{roi['height']}:{roi['left']}:{roi['top']},"
+        f"format=gray,"
         f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2:black,"
         f"drawtext=fontcolor=white:fontsize={overlay['font_size']}:"
         f"box=1:boxcolor=black@0.5:"
@@ -106,14 +107,13 @@ def run_ffmpeg_analysis(input_file, output_file, roi, canvas, overlay, processin
 
     cmd += [
         "-vf", vf,
-        "-c:v", processing["video_codec"],
-        "-preset", processing["preset"],
-        "-crf", str(processing["crf"]),
-        "-c:a", "copy" if processing["copy_audio"] else "aac",
+        "-c:v", "mjpeg",          # <-- szybkie kodowanie intra
+        "-q:v", "5",              # jakość (2=wysoka, 31=najgorsza)
+        "-an",                    # brak audio (niepotrzebne)
         str(output_file),
     ]
 
-    logger.info(f"Analiza: {input_file}")
+    logger.info(f"Analiza (grayscale+mjpeg): {input_file}")
     subprocess.run(cmd, check=True)
 
 
@@ -135,7 +135,6 @@ def main():
     roi = camera_cfg["roi"]
     canvas = camera_cfg["canvas"]
     overlay = camera_cfg["overlay"]
-    processing = camera_cfg["processing"]
     time_window = camera_cfg["time_window"]
 
     # ========================================================
@@ -162,13 +161,13 @@ def main():
         if not found_file:
             raise RuntimeError("Plik nie istnieje w katalogu kamery.")
 
-        result_file = BASE_RESULTS / camera / date / f"{found_file.stem}_analysis.mkv"
+        result_file = BASE_RESULTS / camera / date / f"{found_file.stem}_analysis.avi"
 
         if result_file.exists() and not force:
             logger.info("Plik już przetworzony.")
             return
 
-        run_ffmpeg_analysis(found_file, result_file, roi, canvas, overlay, processing, time_window)
+        run_ffmpeg_analysis(found_file, result_file, roi, canvas, overlay, time_window)
         return
 
     # ========================================================
@@ -203,12 +202,12 @@ def main():
 
         for segment in filtered:
 
-            result_file = BASE_RESULTS / camera / DATE / f"{segment.path.stem}_analysis.mkv"
+            result_file = BASE_RESULTS / camera / DATE / f"{segment.path.stem}_analysis.avi"
 
             if result_file.exists():
                 continue
 
-            run_ffmpeg_analysis(segment.path, result_file, roi, canvas, overlay, processing, time_window)
+            run_ffmpeg_analysis(segment.path, result_file, roi, canvas, overlay, time_window)
 
 
 if __name__ == "__main__":

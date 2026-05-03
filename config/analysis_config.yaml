@@ -23,14 +23,14 @@ cameras:
 
   POE_BRAMA:
     roi:
-      left: 315
-      top: 1490
-      width: 40
-      height: 40
+      left: 310
+      top: 1475
+      width: 15
+      height: 25
 
     time_window:
       start_second: 0
-      end_second: 300
+      end_second: 240
 
 
   POE1:
