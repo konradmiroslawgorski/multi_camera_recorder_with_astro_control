@@ -8,15 +8,13 @@ default:
     show_time: true
     box: true
 
-  processing:
-    video_codec: libx264
-    crf: 18
-    preset: veryfast
-    copy_audio: true
-
   time_window:
     start_second: 0
     end_second: null
+
+  detection:
+    window_seconds: 5       # długość okna statystycznego
+    sigma_threshold: 7.0      # próg Z-score
 
 
 cameras:
@@ -24,14 +22,9 @@ cameras:
   POE_BRAMA:
     roi:
       left: 310
-      top: 1475
+      top:  1470
       width: 15
       height: 25
-
-    time_window:
-      start_second: 0
-      end_second: 240
-
 
   POE1:
     roi:
@@ -39,7 +32,3 @@ cameras:
       top: 1200
       width: 50
       height: 80
-
-    time_window:
-      start_second: 0
-      end_second: null

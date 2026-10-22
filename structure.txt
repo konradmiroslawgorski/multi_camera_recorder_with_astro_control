@@ -5,7 +5,6 @@
 ./web
 ./web/index.html
 ./lib
-./lib/lib_astro.sh
 ./venv_motion
 ./venv_motion/pyvenv.cfg
 ./venv_motion/lib64
@@ -29,7 +28,6 @@
 ./scripts/run_batch_all.sh
 ./scripts/batch_sun_precise.sh
 ./scripts/batch_sun_dynamic.sh
-./scripts/record_all.sh
 ./scripts/motion_detect.py
 ./scripts/run_batch_today.sh
 ./scripts/skan_dziury.sh
@@ -38,7 +36,6 @@
 ./requirements.txt
 ./config
 ./config/recording_config.yaml
-./config/cameras.conf
 ./config/astro_today.json
 ./config/mediamtx.yml
 ./config/camera_POE_BRAMA.env
