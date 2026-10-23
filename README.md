@@ -1,11 +1,14 @@
 # Multi Camera Recorder with Astro Control
 
+Repozytorium: https://github.com/konradmiroslawgorski/multi_camera_recorder_with_astro_control
+
 ## Środowisko uruchomieniowe (VM)
 
 Rejestrator działa na maszynie wirtualnej z Ubuntu. Zanim zaczniesz pracę
 (wdrożenie, restart usług, podgląd logów), **uruchom VM serwera**:
 
 - adres IP: `192.168.196.10`
+- user: ubuntu, password: kcb
 - alias SSH: `ubuntu-mv` (wpis w lokalnym pliku `.ssh/config` na Windowsie,
   zwykle `C:\Users\<użytkownik>\.ssh\config`)
 
