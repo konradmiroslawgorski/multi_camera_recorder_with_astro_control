@@ -8,29 +8,31 @@ Rejestrator działa na maszynie wirtualnej z Ubuntu. Zanim zaczniesz pracę
 (wdrożenie, restart usług, podgląd logów), **uruchom VM serwera**:
 
 - adres IP: `192.168.196.10`
-- user: ubuntu, password: kcb
+- użytkownik: ubuntu, hasło: kcb
 - alias SSH: `ubuntu-mv` (wpis w lokalnym pliku `.ssh/config` na Windowsie,
   zwykle `C:\Users\<użytkownik>\.ssh\config`)
 
 Połączenie: `ssh ubuntu-mv`. Ten sam alias wybierzesz w VS Code (Remote - SSH).
 Gdy VM jest wyłączona, kamery nie są nagrywane i nie przychodzą powiadomienia.
 
-## Astronomical recording window
+## Astronomiczne okno nagrywania
 
-Camera services use `config/recording_config.yaml` to record from the configured
-time before sunrise through the configured time after sunset. Sunrise and sunset
-are calculated locally with Astral for the configured location and timezone;
-the recorder does not make HTTP requests.
+Usługi kamer korzystają z `config/recording_config.yaml`, aby nagrywać od
+ustawionego czasu przed wschodem słońca do ustawionego czasu po zachodzie.
+Godziny wschodu i zachodu słońca są obliczane lokalnie przez bibliotekę Astral
+dla skonfigurowanej lokalizacji i strefy czasowej; rejestrator nie wykonuje
+żądań HTTP.
 
-The default window is one hour before sunrise through one hour after sunset.
-Change `recording_window.start` and `recording_window.stop` in the YAML file to
-adjust it. The recorder checks the local schedule every 30 seconds while waiting,
-starts FFmpeg if the service starts during the window, and sends FFmpeg SIGINT at
-the end of the window so it can finalize the current segment.
+Domyślne okno obejmuje czas od godziny przed wschodem słońca do godziny po
+zachodzie. Aby je zmienić, edytuj `recording_window.start` i
+`recording_window.stop` w pliku YAML. Podczas oczekiwania rejestrator sprawdza
+lokalny harmonogram co 30 sekund. Jeśli usługa zostanie uruchomiona w trakcie
+okna, rozpoczyna pracę FFmpeg. Na końcu okna wysyła do FFmpeg sygnał SIGINT,
+aby umożliwić mu zapisanie bieżącego segmentu.
 
-Install the declared Python dependencies into `venv_motion` with
-`venv_motion/bin/pip install -r requirements.txt`. Restart the camera services
-after changing the configuration, for example:
+Zainstaluj wymagane zależności Pythona w środowisku `venv_motion` poleceniem
+`venv_motion/bin/pip install -r requirements.txt`. Po zmianie konfiguracji
+zrestartuj usługi kamer, na przykład:
 `sudo systemctl restart camera@POE1 camera@POE_BRAMA`.
 
 ## Powiadomienia push (ntfy)
