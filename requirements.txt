@@ -1,2 +1,4 @@
 numpy==2.2.6
 opencv-python==4.13.0.92
+astral==3.2
+PyYAML==6.0.3

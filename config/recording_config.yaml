@@ -5,7 +5,17 @@ location:
 
 recording_window:
   start: "sunrise - 1h"
-  stop:  "sunset + 2h"
+  stop:  "sunset + 1h"
 
 segment:
   duration_minutes: 15
+
+notifications:
+  error_group_minutes: 60
+  start_timeout_seconds: 60
+  ntfy:
+    enabled: true
+    server: https://ntfy.sh
+    # Nazwa tematu (sekret) w zmiennej NTFY_TOPIC lub w config/notify.env
+    topic_env: NTFY_TOPIC
+    timeout_seconds: 10

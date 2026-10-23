@@ -1,6 +1,7 @@
 [Unit]
 Description=Camera Recorder %i
-After=network.target
+After=network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
@@ -8,8 +9,8 @@ Type=simple
 User=ubuntu
 Restart=always
 RestartSec=10
-TimeoutStopSec=5
-KillMode=control-group
+TimeoutStopSec=20
+KillMode=mixed
 LimitNOFILE=65536
 
 # Konfiguracja kamery (RTSP_URL, SEGMENT_TIME, PRE_CROP)
