@@ -1,3 +1,4 @@
 /config/notify.env
 __pycache__/
 *.pyc
+/venv_motion/
