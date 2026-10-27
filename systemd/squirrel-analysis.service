@@ -1,0 +1,18 @@
+[Unit]
+Description=Analiza wyjscia wiewiorki (POE_BRAMA), kazde zakonczone nagranie
+After=local-fs.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/projects/mcrwac
+ExecStart=/home/ubuntu/projects/mcrwac/venv_motion/bin/python -m mcrwac.analysis.squirrel_exit_prototype --watch
+Restart=always
+RestartSec=30
+TimeoutStopSec=30
+# Rejestrator ma pierwszenstwo przed analiza (CPU i dysk).
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
