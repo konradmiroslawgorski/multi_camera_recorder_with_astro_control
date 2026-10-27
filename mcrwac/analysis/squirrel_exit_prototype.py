@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time as _time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -23,20 +23,6 @@ class OpeningCandidate:
     x: float
     y: float
     score: float
-
-
-@dataclass
-class _CandidateCluster:
-    x: float
-    y: float
-    scores: list[float] = field(default_factory=list)
-    samples: set[int] = field(default_factory=set)
-
-    def add(self, candidate: OpeningCandidate, sample_index: int) -> None:
-        self.x = (self.x * len(self.scores) + candidate.x) / (len(self.scores) + 1)
-        self.y = (self.y * len(self.scores) + candidate.y) / (len(self.scores) + 1)
-        self.scores.append(candidate.score)
-        self.samples.add(sample_index)
 
 
 @dataclass(frozen=True)
@@ -61,26 +47,27 @@ class Appearance:
 
 
 @dataclass(frozen=True)
-class ReferenceSpec:
+class AnchorSpec:
     file_name: str
     crop_origin: tuple[int, int]
-    opening: tuple[float, float]
+    anchor: tuple[float, float]
 
 
 REFERENCE_DIR = Path(__file__).parent / "reference"
-# Wzorce z różnym oświetleniem: pochmurny poranek, pełne słońce, błękitne niebo.
-REFERENCES = (
-    ReferenceSpec("poe_brama_roof.jpg", (600, 400), (998.9, 792.8)),
-    ReferenceSpec("poe_brama_roof_sun.jpg", (0, 450), (348.0, 744.0)),
-    ReferenceSpec("poe_brama_roof_blue_sky.jpg", (0, 450), (347.0, 744.0)),
-)
-REFERENCE_FEATURES = 4000
-REFERENCE_MIN_INLIERS = 12
+# Dwa punkty, które zawsze są widoczne na tle nieba (cień na ścianie ich nie
+# dotyczy): lewa krawędź komina i szczyt dachu. Współrzędne w pełnej klatce
+# wzorcowej (`11-52-43.mkv`, klatka 0), tak samo jak położenie otworu.
+CHIMNEY_ANCHOR = AnchorSpec("poe_brama_chimney.png", (150, 485), (183.0, 526.0))
+RIDGE_ANCHOR = AnchorSpec("poe_brama_ridge.png", (610, 515), (666.0, 555.0))
+REFERENCE_OPENING = (347.0, 744.0)
+ANCHOR_SCALES = tuple(np.arange(0.85, 1.19, 0.03))
+ANCHOR_MIN_SCORE = 0.58
+TRIANGLE_MIN_SCALE = 0.85
+TRIANGLE_MAX_SCALE = 1.18
+TRIANGLE_MAX_ANGLE_DEG = 15.0
 REFERENCE_MAX_SPREAD_PX = 12.0
 SAMPLE_SECONDS = 3.0
 SAMPLE_INTERVAL_SECONDS = 0.25
-MIN_CANDIDATE_SCORE = 110.0
-MIN_SCORE_MARGIN = 18.0
 MIN_TRACK_CONFIDENCE = 0.60
 TEMPLATE_RADIUS = 48
 SEARCH_RADIUS = 32
@@ -112,180 +99,7 @@ CONFIRM_HITS = 3
 RELEASE_GAP_SECONDS = 1.5
 SEARCH_RETRY_SECONDS = 15.0
 SEARCH_GRID_SECONDS = 60.0
-SEARCH_FALLBACK_SECONDS = 300.0
 LOST_TRACKING_SECONDS = 15.0
-NEAR_SEARCH_RADIUS_PX = 100.0
-MIN_STABILITY = 0.6
-NEAR_MIN_STABILITY = 0.4
-
-
-def _rect_sum(integral: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> int:
-    return int(
-        integral[y2, x2]
-        - integral[y1, x2]
-        - integral[y2, x1]
-        + integral[y1, x1]
-    )
-
-
-def find_opening_candidates(frame: np.ndarray) -> list[OpeningCandidate]:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, dark_mask = cv2.threshold(gray, 45, 255, cv2.THRESH_BINARY_INV)
-    count, _, stats, centers = cv2.connectedComponentsWithStats(dark_mask)
-    edges = cv2.Canny(gray, 35, 100)
-    edge_integral = cv2.integral((edges > 0).astype(np.uint8))
-    candidates: list[OpeningCandidate] = []
-
-    for index in range(1, count):
-        x, y, width, height, area = stats[index]
-        if not (
-            15 <= area <= 100
-            and 3 <= width <= 12
-            and 5 <= height <= 18
-            and 1.2 <= height / width <= 4
-        ):
-            continue
-
-        center_x, center_y = centers[index]
-        cx, cy = int(round(center_x)), int(round(center_y))
-        y1, y2 = max(0, cy - 40), min(gray.shape[0], cy + 41)
-        left_support = max(
-            (
-                _rect_sum(
-                    edge_integral,
-                    max(0, cx + offset),
-                    y1,
-                    max(0, cx + offset) + 1,
-                    y2,
-                )
-                for offset in range(-35, -5)
-                if 0 <= cx + offset < gray.shape[1]
-            ),
-            default=0,
-        )
-        right_support = max(
-            (
-                _rect_sum(
-                    edge_integral,
-                    cx + offset,
-                    y1,
-                    cx + offset + 1,
-                    y2,
-                )
-                for offset in range(6, 36)
-                if 0 <= cx + offset < gray.shape[1]
-            ),
-            default=0,
-        )
-        x1, x2 = max(0, cx - 35), min(gray.shape[1], cx + 36)
-        horizontal_support = max(
-            (
-                _rect_sum(edge_integral, x1, row, x2, row + 1)
-                for row in range(max(0, cy - 15), min(gray.shape[0], cy + 16))
-            ),
-            default=0,
-        )
-        darkness = float(gray[y:y + height, x:x + width].mean())
-        score = left_support + right_support + horizontal_support
-        score += max(0.0, 80.0 - darkness) * 0.5
-
-        if score >= MIN_CANDIDATE_SCORE:
-            candidates.append(OpeningCandidate(float(center_x), float(center_y), score))
-
-    return candidates
-
-
-def locate_opening(
-    frames: Iterable[np.ndarray],
-    near: Optional[OpeningCandidate] = None,
-    near_radius_px: float = NEAR_SEARCH_RADIUS_PX,
-) -> OpeningCandidate:
-    clusters: list[_CandidateCluster] = []
-    sample_count = 0
-
-    for sample_index, frame in enumerate(frames):
-        sample_count = sample_index + 1
-        candidates = find_opening_candidates(frame)
-        if near is not None:
-            candidates = [
-                candidate
-                for candidate in candidates
-                if np.hypot(candidate.x - near.x, candidate.y - near.y) <= near_radius_px
-            ]
-        candidates = sorted(
-            candidates, key=lambda candidate: candidate.score, reverse=True
-        )[:100]
-        used: set[int] = set()
-        for candidate in candidates:
-            nearest_index: Optional[int] = None
-            nearest_distance = 8.0
-            for cluster_index, cluster in enumerate(clusters):
-                if sample_index in cluster.samples:
-                    continue
-                distance = float(np.hypot(candidate.x - cluster.x, candidate.y - cluster.y))
-                if distance < nearest_distance:
-                    nearest_index = cluster_index
-                    nearest_distance = distance
-            if nearest_index is None:
-                clusters.append(
-                    _CandidateCluster(candidate.x, candidate.y, [candidate.score], {sample_index})
-                )
-                used.add(len(clusters) - 1)
-            elif nearest_index in used:
-                continue
-            else:
-                clusters[nearest_index].add(candidate, sample_index)
-                used.add(nearest_index)
-
-    ranked = sorted(
-        clusters,
-        key=lambda cluster: (
-            float(np.mean(cluster.scores)),
-            len(cluster.samples),
-        ),
-        reverse=True,
-    )
-    if not ranked:
-        raise RuntimeError("Nie znaleziono wiarygodnego kandydata na otwór.")
-
-    stability = NEAR_MIN_STABILITY if near is not None else MIN_STABILITY
-    required_samples = max(3, int(np.ceil(sample_count * stability)))
-    stable_candidates = [
-        cluster for cluster in ranked if len(cluster.samples) >= required_samples
-    ]
-    if not stable_candidates:
-        best = ranked[0]
-        raise RuntimeError(
-            "Nie znaleziono stabilnego otworu: najlepszy kandydat "
-            f"({best.x:.1f}, {best.y:.1f}) pasował tylko w "
-            f"{len(best.samples)}/{sample_count} klatkach kalibracyjnych."
-        )
-
-    if near is not None:
-        # Kamera tylko minimalnie się porusza, więc liczy się bliskość poprzedniej pozycji.
-        closest = min(
-            stable_candidates,
-            key=lambda cluster: float(np.hypot(cluster.x - near.x, cluster.y - near.y)),
-        )
-        return OpeningCandidate(closest.x, closest.y, float(np.mean(closest.scores)))
-
-    best, *competitors = stable_candidates
-    best_mean = float(np.mean(best.scores))
-    second_mean = float(np.mean(competitors[0].scores)) if competitors else 0.0
-    score_margin = best_mean - second_mean
-    if competitors and score_margin < MIN_SCORE_MARGIN:
-        second = competitors[0]
-        raise RuntimeError(
-            "Lokalizacja otworu jest niejednoznaczna; analiza tej próbki "
-            f"została pominięta. Kandydat ({best.x:.1f}, {best.y:.1f}) "
-            f"uzyskał {best_mean:.1f} w {len(best.samples)}/{sample_count} "
-            f"klatkach, a konkurencyjny ({second.x:.1f}, {second.y:.1f}) "
-            f"{second_mean:.1f} w {len(second.samples)}/{sample_count}; "
-            f"różnica {score_margin:.1f} jest mniejsza niż "
-            f"{MIN_SCORE_MARGIN:.1f}."
-        )
-
-    return OpeningCandidate(best.x, best.y, best_mean)
 
 
 def _sample_calibration_frames(
@@ -306,101 +120,133 @@ def _sample_calibration_frames(
 
 
 def _prepare_for_matching(image: np.ndarray) -> np.ndarray:
+    """Mapa krawędzi niezależna od jasności i kontrastu (noc, słońce, mgła)."""
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return cv2.createCLAHE(3.0, (8, 8)).apply(gray)
+    gray = cv2.GaussianBlur(cv2.createCLAHE(3.0, (8, 8)).apply(gray), (0, 0), 1.2)
+    magnitude = cv2.magnitude(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0), cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+    )
+    return magnitude + _flat_area_noise(magnitude.shape)
+
+
+@lru_cache(maxsize=4)
+def _flat_area_noise(shape: tuple[int, ...]) -> np.ndarray:
+    # Płaskie (prześwietlone) obszary mają zerową wariancję i dawałyby fałszywe
+    # dopasowania o wyniku 1,0.
+    return np.random.default_rng(0).random(shape, dtype=np.float32) * 4.0
 
 
 @dataclass(frozen=True)
-class _ReferenceView:
-    points: np.ndarray
-    descriptors: np.ndarray
-    opening: tuple[float, float]
+class _AnchorTemplate:
+    scaled: tuple[tuple[float, np.ndarray], ...]
+    offset: tuple[float, float]
 
 
 @lru_cache(maxsize=1)
-def _load_references() -> list[_ReferenceView]:
-    sift = cv2.SIFT_create(REFERENCE_FEATURES)
-    views: list[_ReferenceView] = []
-    for spec in REFERENCES:
+def _load_anchor_templates() -> Optional[tuple[_AnchorTemplate, _AnchorTemplate]]:
+    templates: list[_AnchorTemplate] = []
+    for spec in (CHIMNEY_ANCHOR, RIDGE_ANCHOR):
         image = cv2.imread(str(REFERENCE_DIR / spec.file_name), cv2.IMREAD_GRAYSCALE)
         if image is None:
-            continue
-        keypoints, descriptors = sift.detectAndCompute(_prepare_for_matching(image), None)
-        if descriptors is None:
-            continue
-        points = np.float32([keypoint.pt for keypoint in keypoints]) + np.float32(
-            spec.crop_origin
+            return None
+        edges = _prepare_for_matching(image)
+        scaled = tuple(
+            (float(scale), cv2.resize(edges, None, fx=scale, fy=scale))
+            for scale in ANCHOR_SCALES
         )
-        views.append(_ReferenceView(points, descriptors, spec.opening))
-    return views
+        offset = (
+            spec.anchor[0] - spec.crop_origin[0],
+            spec.anchor[1] - spec.crop_origin[1],
+        )
+        templates.append(_AnchorTemplate(scaled, offset))
+    return templates[0], templates[1]
 
 
-def _estimate_opening_from_view(
-    view: _ReferenceView,
-    keypoints: Sequence[cv2.KeyPoint],
-    descriptors: np.ndarray,
-    frame_shape: tuple[int, ...],
-    matcher: cv2.BFMatcher,
+def _find_anchor(
+    edges: np.ndarray, template: _AnchorTemplate
+) -> tuple[float, np.ndarray]:
+    best_score, best_point = -1.0, np.zeros(2)
+    for scale, scaled in template.scaled:
+        if scaled.shape[0] > edges.shape[0] or scaled.shape[1] > edges.shape[1]:
+            continue
+        result = cv2.matchTemplate(edges, scaled, cv2.TM_CCOEFF_NORMED)
+        _, score, _, location = cv2.minMaxLoc(result)
+        if score > best_score:
+            best_score = float(score)
+            best_point = np.array(location, dtype=float) + np.array(template.offset) * scale
+    return best_score, best_point
+
+
+def _opening_from_triangle(
+    chimney: np.ndarray, ridge: np.ndarray, frame_shape: tuple[int, ...]
 ) -> Optional[tuple[float, float]]:
-    pairs = matcher.knnMatch(view.descriptors, descriptors, k=2)
-    good = [p[0] for p in pairs if len(p) == 2 and p[0].distance < 0.8 * p[1].distance]
-    if len(good) < REFERENCE_MIN_INLIERS:
+    """Trójkąt podobny: komin–szczyt dachu–otwór ze wzorca przeniesiony na klatkę."""
+    reference_vector = np.array(RIDGE_ANCHOR.anchor) - np.array(CHIMNEY_ANCHOR.anchor)
+    vector = ridge - chimney
+    scale = float(np.linalg.norm(vector) / np.linalg.norm(reference_vector))
+    angle = math.atan2(vector[1], vector[0]) - math.atan2(
+        reference_vector[1], reference_vector[0]
+    )
+    angle = (angle + math.pi) % (2 * math.pi) - math.pi
+    if (
+        not TRIANGLE_MIN_SCALE <= scale <= TRIANGLE_MAX_SCALE
+        or abs(math.degrees(angle)) > TRIANGLE_MAX_ANGLE_DEG
+    ):
         return None
-    source = np.float32([view.points[m.queryIdx] for m in good])
-    target = np.float32([keypoints[m.trainIdx].pt for m in good])
-    matrix, inliers = cv2.estimateAffinePartial2D(source, target, ransacReprojThreshold=4.0)
-    if matrix is None or int(inliers.sum()) < REFERENCE_MIN_INLIERS:
-        return None
-    scale = float(np.hypot(matrix[0, 0], matrix[1, 0]))
-    angle = abs(math.degrees(math.atan2(matrix[1, 0], matrix[0, 0])))
-    if not 0.85 <= scale <= 1.18 or angle > 15.0:
-        return None
-    x, y = matrix @ np.array([view.opening[0], view.opening[1], 1.0])
+    rotation = np.array(
+        [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]]
+    )
+    offset = np.array(REFERENCE_OPENING) - np.array(CHIMNEY_ANCHOR.anchor)
+    x, y = chimney + scale * rotation @ offset
     height, width = frame_shape[:2]
     if 0 <= x < width and 0 <= y < height:
         return float(x), float(y)
     return None
 
 
+def _estimate_opening(
+    frame: np.ndarray, templates: tuple[_AnchorTemplate, _AnchorTemplate]
+) -> Optional[tuple[float, float]]:
+    edges = _prepare_for_matching(frame)
+    chimney_score, chimney = _find_anchor(edges, templates[0])
+    ridge_score, ridge = _find_anchor(edges, templates[1])
+    if min(chimney_score, ridge_score) < ANCHOR_MIN_SCORE:
+        return None
+    return _opening_from_triangle(chimney, ridge, frame.shape)
+
+
 def _probe_reference(capture: cv2.VideoCapture, frame_index: int) -> bool:
-    """Szybki test: czy jedna klatka daje dopasowanie do wzorca (otwór widoczny)."""
+    """Szybki test: czy jedna klatka daje komin i szczyt dachu (otwór wyliczalny)."""
     capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
     ok, frame = capture.read()
     if not ok:
         return False
-    return locate_opening_by_reference([frame], min_estimates=1) is not None
+    return locate_opening_by_triangle([frame], min_estimates=1) is not None
 
 
-def locate_opening_by_reference(
+def locate_opening_by_triangle(
     frames: Iterable[np.ndarray],
     min_estimates: int = 2,
 ) -> Optional[OpeningCandidate]:
-    """Wylicza położenie otworu z dopasowania dachu i ścian do wzorców.
+    """Wylicza położenie otworu z dwóch punktów: komina i szczytu dachu.
 
-    Wzorców jest kilka (różne oświetlenie), a w każdej klatce wygrywa pierwszy,
-    który da wiarygodne dopasowanie. Działa też po przesunięciu lub obrocie
-    kamery. Zwraca None, gdy obraz jest zbyt słaby na wiarygodne dopasowanie.
+    Oba punkty leżą na tle nieba, więc cień na ścianie ani drzewa nie psują
+    wyniku. Z ich odległości i kąta wynika skala i obrót względem wzorca, a
+    otwór jest trzecim wierzchołkiem podobnego trójkąta, także gdy go nie
+    widać. Zwraca None, gdy komina lub szczytu dachu nie da się wiarygodnie
+    znaleźć albo wyniki z kolejnych klatek się rozjeżdżają.
     """
-    views = _load_references()
-    if not views:
+    templates = _load_anchor_templates()
+    if templates is None:
         return None
-    sift = cv2.SIFT_create(REFERENCE_FEATURES)
-    matcher = cv2.BFMatcher()
     estimates: list[tuple[float, float]] = []
     sample_count = 0
 
     for frame in frames:
         sample_count += 1
-        keypoints, descriptors = sift.detectAndCompute(_prepare_for_matching(frame), None)
-        if descriptors is None or len(keypoints) < REFERENCE_MIN_INLIERS:
-            continue
-        for view in views:
-            estimate = _estimate_opening_from_view(
-                view, keypoints, descriptors, frame.shape, matcher
-            )
-            if estimate is not None:
-                estimates.append(estimate)
-                break
+        estimate = _estimate_opening(frame, templates)
+        if estimate is not None:
+            estimates.append(estimate)
 
     if sample_count == 0 or len(estimates) < max(min_estimates, sample_count // 2):
         return None
@@ -420,21 +266,19 @@ def _find_opening(
     frame_count: int,
     start_frame: int,
     retry_frames: int,
-    near: Optional[OpeningCandidate] = None,
 ) -> Optional[tuple[OpeningCandidate, np.ndarray, int]]:
-    """Szuka momentu, od którego otwór jest wiarygodnie widoczny.
+    """Szuka momentu, od którego komin i szczyt dachu są wiarygodnie widoczne.
 
     1. Rzadka siatka (co `SEARCH_GRID_SECONDS`): w każdym punkcie jedna klatka
-       dopasowywana do wzorców (kilka sekund zamiast ok. minuty na 13 klatek).
-    2. Po trafieniu bisekcja między ostatnim punktem bez otworu a trafionym, do
+       (ok. 1,5 s zamiast ok. 20 s na 13 klatek).
+    2. Po trafieniu bisekcja między ostatnim punktem bez trójkąta a trafionym, do
        dokładności `retry_frames`; wynik potwierdza dopasowanie 13 klatek.
-    3. Gdy wzorce nie działają w żadnym punkcie, rzadka siatka z wolniejszą
-       metodą bez wzorca (szukanie samego otworu; po utracie ogranicza je `near`).
+    Otwór wylicza się z trójkąta, więc nie musi być widoczny.
     """
     grid = max(retry_frames, int(round(fps * SEARCH_GRID_SECONDS)))
     _log(
-        f"[{_format_elapsed(start_frame / fps)}] Szukam otworu: siatka co "
-        f"{grid / fps:.0f} s, potem bisekcja.",
+        f"[{_format_elapsed(start_frame / fps)}] Szukam komina i szczytu dachu: "
+        f"siatka co {grid / fps:.0f} s, potem bisekcja.",
         flush=True,
     )
 
@@ -456,32 +300,16 @@ def _find_opening(
                     low = middle
             first = high
         frames = _sample_calibration_frames(capture, fps, first)
-        opening = locate_opening_by_reference(frames) if frames else None
+        opening = locate_opening_by_triangle(frames) if frames else None
         if opening is not None:
             _log(
-                f"[{_format_elapsed(first / fps)}] Otwór wyznaczony ze wzorca: "
-                f"({opening.x:.0f}, {opening.y:.0f}).",
+                f"[{_format_elapsed(first / fps)}] Otwór wyliczony z trójkąta "
+                f"komin–szczyt dachu: ({opening.x:.0f}, {opening.y:.0f}).",
                 flush=True,
             )
             return opening, frames[0], first
         hidden = first
         index = first + grid
-
-    fallback_step = max(grid, int(round(fps * SEARCH_FALLBACK_SECONDS)))
-    for attempt_start in range(start_frame, frame_count, fallback_step):
-        frames = _sample_calibration_frames(capture, fps, attempt_start)
-        if not frames:
-            break
-        try:
-            opening = locate_opening(frames, near=near)
-        except RuntimeError as error:
-            reason = str(error).split(";")[0].split(":")[0]
-            _log(
-                f"[{_format_elapsed(attempt_start / fps)}] Otwór niewidoczny ({reason}).",
-                flush=True,
-            )
-            continue
-        return opening, frames[0], attempt_start
     return None
 
 
@@ -861,7 +689,6 @@ def analyze_video(
     analyzed_fps = fps / frame_step
     lost_limit = max(1, int(round(analyzed_fps * LOST_TRACKING_SECONDS)))
     opening: Optional[OpeningCandidate] = None
-    last_opening: Optional[OpeningCandidate] = None
     reference_gray: Optional[np.ndarray] = None
     background: Optional[AdaptiveBackground] = None
     lost_frames = 0
@@ -889,7 +716,6 @@ def analyze_video(
                         frame_count,
                         frame_index,
                         retry_frames,
-                        near=last_opening,
                     )
                     if found is None:
                         break

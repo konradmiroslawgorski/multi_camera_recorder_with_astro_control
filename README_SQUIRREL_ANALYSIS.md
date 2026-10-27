@@ -13,46 +13,38 @@ nagrywających. Wiewiórka nie jest rozpoznawana jako gatunek: program wykrywa
 Poniższe wartości (piksele dla nagrań 2304×1296, 12 kl./s) są stałymi na górze
 pliku prototypu.
 
-1. **Szukanie otworu.** Najpierw z klatek próbkowanych co 0,25 s przez 3 s
-   (13 klatek) program wyznacza położenie otworu *metodą wzorca*: dopasowuje
-   cechy SIFT dachu i ścian (kominy, antena, krawędzie) do wzorców w
-   [`mcrwac/analysis/reference/`](mcrwac/analysis/reference/): `poe_brama_roof.jpg`
-   (pochmurny poranek), `poe_brama_roof_sun.jpg` (pełne słońce) i
-   `poe_brama_roof_blue_sky.jpg` (słońce i błękitne niebo); dla każdej
-   klatki próbowane są kolejno wszystkie wzorce, bo przy innym oświetleniu
-   jeden z nich może się nie dopasować
-   (RANSAC, przynajmniej 12 zgodnych punktów, skala 0,85–1,18, obrót do 15°)
-   i przelicza znane położenie otworu na bieżący obraz. Dzięki temu działa także
-   po restarcie lub przesunięciu kamery. Wynik jest przyjęty, gdy zgadza się w
-   co najmniej połowie klatek (rozrzut do 12 px). Aby dodać wzorzec dla nowego
-   oświetlenia lub ustawienia kamery, zapisz fragment klatki (szary JPG) w tym
-   katalogu i dopisz go z początkiem kadru oraz położeniem otworu do
-   `REFERENCES` w pliku prototypu. Uwaga: wzorce są dopasowane do widoku
-   kamery `POE_BRAMA`.
-2. **Plan B: szukanie samego otworu.** Jeśli wzorzec się nie dopasuje, program
-   szuka w obrazie małych, ciemnych plamek (jasność < 45, pole 15–100 px,
-   proporcje 1,2–4:1), punktując je krawędziami okna/ściany po obu stronach i
-   ciemnością. Kandydat musi się powtarzać w ≥ 60% klatek, a jego wynik
-   przewyższać konkurenta o ≥ 18 punktów; w przeciwnym razie lokalizacja jest
-   „niejednoznaczna".
-3. **Otwór niewidoczny — szukanie siatką i bisekcją.** Przy złym świetle,
-   deszczu lub ciemnej chmurze program nie kończy się błędem. Zamiast
-   sprawdzać film co 15 s (jedna próba na 13 klatkach trwa ok. minuty),
-   sprawdza **jedną klatkę co 60 s** (dopasowanie do wzorców, kilka sekund).
-   Po pierwszej udanej klatce wykonuje **bisekcję** między nią a ostatnią
-   klatką bez otworu, do dokładności 15 s, i potwierdza wynik krokiem 1 (13
-   klatek). Analiza rusza od tego momentu, więc nie traci początku. Jeśli
-   wzorce nie działają w żadnym punkcie, na rzadkiej siatce (co 5 min) próbuje
-   planu B. Gdy nie znajdzie otworu w całym pozostałym fragmencie, kończy plik
-   bez wyników. Założenie: otwór jest widoczny od jednego momentu w danym
-   przedziale 60 s; krótsze okna widoczności (np. chmura mijająca w mniej niż
-   minutę) mogą zostać pominięte.
-4. **Śledzenie.** Dla każdej analizowanej klatki program dopasowuje wzorzec otoczenia otworu
+1. **Szukanie otworu (trójkąt podobny).** Program nie szuka samego otworu, bo
+   jest mały i bywa niewidoczny (słońce, mgła, noc). Zamiast tego znajduje dwa
+   punkty, które zawsze są widoczne na tle nieba: **lewą krawędź komina** i
+   **szczyt dachu**. Ich wzorce (małe wycinki krawędzi, nie jasności) leżą w
+   [`mcrwac/analysis/reference/`](mcrwac/analysis/reference/):
+   `poe_brama_chimney.png` i `poe_brama_ridge.png`. Cień na ścianie ani drzewa
+   ich nie zasłaniają, więc metoda działa przy każdym oświetleniu. Wzorce są
+   dopasowywane do całej klatki w skalach 0,85–1,18. Odległość i kąt między
+   znalezionymi punktami dają skalę i obrót względem wzorca, a otwór jest
+   **trzecim wierzchołkiem trójkąta podobnego** (komin–szczyt–otwór) ze wzorca,
+   przeniesionego na bieżącą klatkę; nie musi być widoczny. Warunki: wynik
+   dopasowania każdego z dwóch punktów ≥ 0,58, skala trójkąta 0,85–1,18, obrót
+   do 15°, wynik w kadrze. Z klatek próbkowanych co 0,25 s przez 3 s (13 klatek)
+   wynik jest przyjęty, gdy powstaje w co najmniej połowie klatek (rozrzut do
+   12 px). Działa także po restarcie lub przesunięciu kamery. Uwaga: wzorce
+   pochodzą z `11-52-43.mkv` (klatka 0, otwór ≈ (347, 744)) i są dopasowane do
+   widoku kamery `POE_BRAMA`.
+2. **Komin lub szczyt niewidoczny — szukanie siatką i bisekcją.** Przy
+   ciemności lub mgle (np. nocą komin widać dopiero pod koniec nagrania) program
+   nie kończy się błędem. Zamiast sprawdzać film co 15 s sprawdza **jedną
+   klatkę co 60 s** (ok. 1,5 s na klatkę). Po pierwszej udanej klatce wykonuje
+   **bisekcję** między nią a ostatnią klatką bez trójkąta, do dokładności 15 s,
+   i potwierdza wynik krokiem 1 (13 klatek). Analiza rusza od tego momentu, więc
+   nie traci początku. Gdy nie znajdzie trójkąta w całym pozostałym fragmencie,
+   kończy plik bez wyników. Założenie: punkty są widoczne od jednego momentu w
+   danym przedziale 60 s; krótsze okna widoczności mogą zostać pominięte.
+3. **Śledzenie.** Dla każdej analizowanej klatki program dopasowuje wzorzec otoczenia otworu
    (`matchTemplate`, okno ±48 px, szukanie ±32 px) i koryguje położenie, więc
    drobne ruchy kamery nie przeszkadzają. Klatki o pewności < 0,60 są pomijane.
    Po ok. 15 s takich klatek otwór uznaje się za utracony i program wraca do
-   kroku 1, szukając tylko w promieniu 100 px od ostatniej pozycji (próg
-   stabilności obniżony do 40%), aż otwór pojawi się znowu.
+   kroku 1, szukając od miejsca utraty, aż komin i szczyt dachu będą znowu
+   widoczne.
 5. **Tło.** Obszar analizy to okno wokół otworu: ±45 px w poziomie, 60 px w górę
    i 80 px w dół. Jego tło startuje z klatki odniesienia i jest powoli
    aktualizowane (współczynnik 0,01), więc zmiany oświetlenia nie dają alarmu.

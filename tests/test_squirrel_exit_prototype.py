@@ -13,13 +13,13 @@ from mcrwac.analysis.squirrel_exit_prototype import (
     Appearance,
     AppearanceDetector,
     OpeningCandidate,
-    REFERENCES,
+    REFERENCE_DIR,
     TrackResult,
     _activity_mask,
     _find_opening,
     _format_elapsed,
     _load_analyzed,
-    _load_references,
+    _load_anchor_templates,
     _mark_analyzed,
     _recording_start_time,
     _reference_window,
@@ -28,7 +28,7 @@ from mcrwac.analysis.squirrel_exit_prototype import (
     _timestamped_output_path,
     _update_background,
     activity_regions,
-    locate_opening,
+    locate_opening_by_triangle,
     next_pending_recording,
     select_recordings,
     track_opening,
@@ -45,14 +45,6 @@ def _scene() -> np.ndarray:
 
 
 class SquirrelExitPrototypeTests(unittest.TestCase):
-    def test_locates_repeated_small_dark_opening_without_fixed_roi(self) -> None:
-        frames = [_scene() for _ in range(13)]
-
-        opening = locate_opening(frames)
-
-        self.assertAlmostEqual(opening.x, 132, delta=2)
-        self.assertAlmostEqual(opening.y, 150, delta=2)
-
     def test_tracks_opening_after_small_camera_translation(self) -> None:
         reference = _scene()
         reference_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
@@ -90,12 +82,43 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         mask, _, _ = _activity_mask(dark, reference_gray, opening, tracked)
         self.assertGreater(cv2.countNonZero(mask), 300)
 
-    def test_loads_all_reference_views_with_features(self) -> None:
-        views = _load_references()
+    def _roof_frame(self, shift=(0, 0)) -> np.ndarray:
+        """Klatka z szumem, na której wklejono komin i szczyt dachu ze wzorców."""
+        rng = np.random.default_rng(1)
+        gray = rng.integers(90, 130, (1296, 2304), dtype=np.uint8)
+        for name, (x, y) in (
+            ("poe_brama_chimney.png", (150, 485)),
+            ("poe_brama_ridge.png", (610, 515)),
+        ):
+            patch = cv2.imread(str(REFERENCE_DIR / name), cv2.IMREAD_GRAYSCALE)
+            h, w = patch.shape
+            gray[y + shift[1]:y + shift[1] + h, x + shift[0]:x + shift[0] + w] = patch
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-        self.assertEqual(len(views), len(REFERENCES))
-        for view in views:
-            self.assertGreater(len(view.points), 500)
+    def test_loads_both_anchor_templates(self) -> None:
+        templates = _load_anchor_templates()
+
+        self.assertIsNotNone(templates)
+        for template in templates:
+            self.assertGreater(len(template.scaled), 5)
+
+    def test_triangle_gives_reference_opening_and_follows_camera_shift(self) -> None:
+        opening = locate_opening_by_triangle([self._roof_frame()], min_estimates=1)
+        shifted = locate_opening_by_triangle(
+            [self._roof_frame((120, -40))], min_estimates=1
+        )
+
+        self.assertAlmostEqual(opening.x, 347, delta=2)
+        self.assertAlmostEqual(opening.y, 744, delta=2)
+        self.assertAlmostEqual(shifted.x, 467, delta=2)
+        self.assertAlmostEqual(shifted.y, 704, delta=2)
+
+    def test_triangle_rejects_frame_without_chimney_and_ridge(self) -> None:
+        rng = np.random.default_rng(2)
+        gray = rng.integers(90, 130, (1296, 2304), dtype=np.uint8)
+        frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+        self.assertIsNone(locate_opening_by_triangle([frame]))
 
     def test_background_slow_change_scenario(self) -> None:
         reference = _scene()
@@ -122,48 +145,6 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         regions, _ = activity_regions(mask, 30.0)
         self.assertEqual(len(regions), 1)
 
-    def test_accepts_strong_candidate_visible_in_most_calibration_frames(self) -> None:
-        frame = _scene()
-        candidates = [
-            OpeningCandidate(132, 150, 160),
-            OpeningCandidate(205, 150, 120),
-        ]
-
-        with patch(
-            "mcrwac.analysis.squirrel_exit_prototype.find_opening_candidates",
-            side_effect=[candidates, candidates[:1], candidates] + [candidates] * 10,
-        ):
-            opening = locate_opening([frame.copy() for _ in range(13)])
-
-        self.assertAlmostEqual(opening.x, 132)
-        self.assertAlmostEqual(opening.y, 150)
-
-    def test_skips_ambiguous_candidates_instead_of_guessing(self) -> None:
-        frame = _scene()
-        candidates = [
-            OpeningCandidate(132, 150, 150),
-            OpeningCandidate(205, 150, 145),
-        ]
-
-        with patch(
-            "mcrwac.analysis.squirrel_exit_prototype.find_opening_candidates",
-            return_value=candidates,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "niejednoznaczna"):
-                locate_opening([frame.copy() for _ in range(13)])
-
-    def test_reports_when_no_candidate_is_stable(self) -> None:
-        frame = _scene()
-        candidate = OpeningCandidate(132, 150, 150)
-        responses = [[candidate] if index % 2 == 0 else [] for index in range(13)]
-
-        with patch(
-            "mcrwac.analysis.squirrel_exit_prototype.find_opening_candidates",
-            side_effect=responses,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "tylko w 7/13"):
-                locate_opening([frame.copy() for _ in range(13)])
-
     def test_activity_regions_filter_by_bounding_box_diagonal(self) -> None:
         mask = np.zeros((100, 100), dtype=np.uint8)
         cv2.rectangle(mask, (5, 5), (15, 15), 255, -1)
@@ -188,30 +169,6 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         self.assertEqual((regions[0].width, regions[0].height), (16, 31))
         self.assertGreater(largest_diagonal, regions[0].diagonal)
 
-    def test_locate_opening_near_previous_position_ignores_stronger_far_candidates(
-        self,
-    ) -> None:
-        frame = _scene()
-        candidates = [
-            OpeningCandidate(900, 400, 170),
-            OpeningCandidate(1500, 90, 168),
-            OpeningCandidate(132, 150, 125),
-        ]
-
-        with patch(
-            "mcrwac.analysis.squirrel_exit_prototype.find_opening_candidates",
-            return_value=candidates,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "niejednoznaczna"):
-                locate_opening([frame.copy() for _ in range(13)])
-            opening = locate_opening(
-                [frame.copy() for _ in range(13)],
-                near=OpeningCandidate(140, 160, 1),
-            )
-
-        self.assertAlmostEqual(opening.x, 132)
-        self.assertAlmostEqual(opening.y, 150)
-
     def _run_find_opening(self, visible_from, frame_count=1000, visible_until=None):
         """Otwór widoczny w klatkach [visible_from, visible_until)."""
         frame = _scene()
@@ -226,11 +183,8 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             "mcrwac.analysis.squirrel_exit_prototype._sample_calibration_frames",
             side_effect=lambda capture, fps, start: [frame],
         ), patch(
-            "mcrwac.analysis.squirrel_exit_prototype.locate_opening_by_reference",
+            "mcrwac.analysis.squirrel_exit_prototype.locate_opening_by_triangle",
             return_value=opening,
-        ), patch(
-            "mcrwac.analysis.squirrel_exit_prototype.locate_opening",
-            side_effect=RuntimeError("Nie znaleziono stabilnego otworu: x"),
         ):
             found = _find_opening(
                 capture=None, fps=10, frame_count=frame_count, start_frame=0, retry_frames=150

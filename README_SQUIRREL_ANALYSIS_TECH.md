@@ -6,7 +6,7 @@ Uzupełnienie [README_SQUIRREL_ANALYSIS.md](README_SQUIRREL_ANALYSIS.md). Opisuj
 
 - Kamera POE_BRAMA (2304×1296, 12 kl./s) nagrywa ścianę z małym otworem (ok. 10×15 px). Wiewiórka wychodzi z otworu.
 - Analiza jest **offline** (po nagraniu), nie wpływa na rejestrator. Wynik: klipy 3 min od wykrycia, CSV, lista przeanalizowanych plików.
-- Wymagania: Python 3.10, `numpy`, `opencv-python` (z SIFT), `ffmpeg` w PATH (klipy), `pip install -r requirements.txt` do `venv_motion`.
+- Wymagania: Python 3.10, `numpy`, `opencv-python`, `ffmpeg` w PATH (klipy), `pip install -r requirements.txt` do `venv_motion`.
 - Nagrania: `/opt/cameras/recordings/<KAMERA>/RRRR-MM-DD/GG-MM-SS.mkv` (czas startu w nazwie, segmenty ok. 30 min). Wyniki: `/opt/cameras/recordings/analysis/RRRR-MM-DD/`.
 - Kamera po restarcie zmienia położenie (25.10 otwór ≈ (999, 793); 26–27.10 ≈ (347, 744)), a światło zmienia się od pochmurnego po pełne słońce i błękitne niebo. Stąd lokalizacja otworu na każdym pliku, nie stałe współrzędne.
 
@@ -16,8 +16,8 @@ Jeden moduł, bez stanu globalnego poza `lru_cache` wzorców.
 
 | Etap | Funkcje |
 |---|---|
-| Wzorce | `REFERENCES` (`ReferenceSpec(file, crop_origin, opening)`), `_load_references` (SIFT, cache) |
-| Lokalizacja otworu | `_probe_reference` (1 klatka), `locate_opening_by_reference` (13 klatek), `_find_opening` (siatka + bisekcja + plan B), `locate_opening`/`find_opening_candidates` (plan B) |
+| Wzorce | `AnchorSpec`, `CHIMNEY_ANCHOR`, `RIDGE_ANCHOR`, `REFERENCE_OPENING`, `_load_anchor_templates` (cache) |
+| Lokalizacja otworu | `_find_anchor`, `_opening_from_triangle`, `_probe_reference` (1 klatka), `locate_opening_by_triangle` (13 klatek), `_find_opening` (siatka + bisekcja) |
 | Śledzenie | `track_opening` (matchTemplate, okno ±32 px) |
 | Wykrywanie zmian | `AdaptiveBackground`, `_update_background`, `_activity_mask`, `activity_regions` |
 | Decyzja | `AppearanceDetector` (okno i liczba trafień) |
@@ -29,18 +29,17 @@ Przepływ `analyze_video`: odczyt metadanych → `_find_opening` → pętla klat
 
 ## 3. Lokalizacja otworu
 
-1. **Wzorce SIFT.** Każdy wzorzec to wycinek pierwszej klatki z danego oświetlenia (`reference/*.jpg`), z `crop_origin` (lewy górny róg wycinka w pełnej klatce) i `opening` (współrzędne otworu w pełnej klatce wzorca). Obecne: pochmurno (`poe_brama_roof.jpg`), słońce (`…_sun.jpg`), błękitne niebo (`…_blue_sky.jpg`, crop `[450:1050, 0:850]`, origin (0, 450), otwór (347, 744)).
-2. Dopasowanie: SIFT + `estimateAffinePartial2D` (RANSAC, próg 4 px). Akceptacja: ≥ 12 inlierów, skala 0,85–1,18, obrót ≤ 15°. Pozycja otworu = transformacja punktu `opening`.
-3. **Pełne potwierdzenie**: 13 klatek, zgodność ≥ połowy, rozrzut ≤ 12 px. Szybki test (`min_estimates=1`) używa jednej klatki.
-4. **`_find_opening`**: klatka 0 → jeśli OK, potwierdzenie i analiza od razu. Jeśli nie: siatka co 60 s (1 klatka na punkt), po pierwszym trafieniu bisekcja wstecz do dokładności 15 s, potem potwierdzenie. Gdy siatka nic nie da — **plan B** co 300 s (wykrywanie ciemnej plamy: próg < 45, pole 15–100 px, proporcje 1,2–4, wynik krawędziowy ≥ 110, przewaga ≥ 18 nad drugim kandydatem). Wyjście z pliku dopiero, gdy w całym pozostałym fragmencie brak otworu.
-5. Koszt: dopasowanie jednej klatki ok. 4–5 s, 13 klatek 40–45 s — dlatego siatka zamiast gęstego próbkowania (pierwsza wersja z próbą co 15 s była za wolna).
+1. **Kotwice.** Dwa wycinki pierwszej klatki `11-52-43.mkv` (`reference/poe_brama_chimney.png`: origin (150, 485), punkt (183, 526) = lewa krawędź komina; `poe_brama_ridge.png`: origin (610, 515), punkt (666, 555) = szczyt dachu), opis w `AnchorSpec`. Otwór wzorca: `REFERENCE_OPENING` = (347, 744).
+2. Dopasowanie: mapa krawędzi (CLAHE, rozmycie, Sobel; płaskie obszary dostają deterministyczny szum), `matchTemplate` w skalach `ANCHOR_SCALES`. Akceptacja: wynik obu kotwic ≥ 0,58, skala 0,85–1,18, obrót ≤ 15°. Otwór = A' + skala·R·(O − A), gdzie A to komin, O otwór.
+3. **Pełne potwierdzenie**: 13 klatek (`locate_opening_by_triangle`), ≥ 2 estymaty, mediana, rozrzut ≤ 12 px.
+4. **`_find_opening`**: klatka 0 → jeśli OK, potwierdzenie i analiza od razu. Jeśli nie: siatka co 60 s (1 klatka na punkt), po pierwszym trafieniu bisekcja wstecz do dokładności 15 s, potem potwierdzenie. Gdy w całym pozostałym fragmencie brak trójkąta — plik kończy bez wyników.
+5. Koszt: klatka ok. 1,5 s; wyszukanie ok. 32 s przy otworze widocznym od początku, 97 s przy trójkącie widocznym od 1500 s.
 
-### Jak dodać wzorzec (nowe światło / pozycja kamery)
-1. Wyciągnij klatkę, na której otwór jest widoczny, np. `ffmpeg -ss 0 -i plik.mkv -frames:v 1 f.png`.
-2. Wytnij obszar z dachem/ścianą wokół otworu (ok. 600×850 px) z dużą ilością charakterystycznych krawędzi; zapisz jako JPG w `mcrwac/analysis/reference/`.
-3. Zanotuj `crop_origin = (x0, y0)` wycinka i `opening = (x, y)` otworu w pełnej klatce (z klatki, nie z wycinka).
-4. Dopisz `ReferenceSpec` do `REFERENCES`.
-5. Sprawdź na kilku momentach każdego pliku testowego (0/60/300/900/1700 s), czy zwraca tę samą pozycję. Powód dopisania trzeciego wzorca: 09-22-43 dawał tylko 4–8 inlierów przy wymaganych 12.
+### Jak odtworzyć kotwice (nowa pozycja kamery / widok)
+1. Wyciągnij klatkę, np. `ffmpeg -ss 0 -i plik.mkv -frames:v 1 f.png`.
+2. Wytnij małe wycinki (szare PNG) wokół lewej krawędzi komina i szczytu dachu, z tłem nieba.
+3. Zapisz w `mcrwac/analysis/reference/`, ustaw w `AnchorSpec` `origin` wycinka i `anchor` (punkt w pełnej klatce) oraz `REFERENCE_OPENING`.
+4. Sprawdź na kilku momentach pliku (0/60/300/900/1700 s), czy pozycja jest stabilna.
 
 ## 4. Wykrywanie wiewiórki
 
@@ -61,7 +60,7 @@ Przepływ `analyze_video`: odczyt metadanych → `_find_opening` → pętla klat
 | `DEFAULT_CLIP_SECONDS` | 180 | 60 s było za mało |
 | `SEARCH_GRID_SECONDS` | 60 | Kompromis szybkość/ryzyko pominięcia okien widoczności < 60 s |
 | `SEARCH_RETRY_SECONDS` | 15 | Dokładność bisekcji |
-| `SEARCH_FALLBACK_SECONDS` | 300 | Plan B jest tani, ale mniej wiarygodny |
+| `ANCHOR_MIN_SCORE` | 0,58 | Fałszywe trafienia nocą miały 0,53–0,57; dodatkowo odrzuca je geometria |
 | `WATCH_SETTLE_SECONDS` | 120 | Plik uznany za zakończony, gdy brak zapisu 120 s lub jest nowszy segment |
 
 Pomiary (VM, 2 rdzenie, obciążona): odczyt sekwencyjny 70 kl./s; plik 30 min — pętla analizy ok. 5 min, reszta to ffmpeg klipów; pełny przebieg z 4 klipami 17,7 min (1065 s zegarowo, 760 s CPU).
@@ -84,7 +83,8 @@ Pliki kontrolne: `2026-10-25/05-49-02-18-19.mkv` (klip, wiewiórka ok. 45,7 s), 
 
 ## 9. Znane ograniczenia i pomysły
 
-- Plan B może zaakceptować fałszywy otwór, gdy żaden wzorzec nie pasuje — przy nowym oświetleniu/pozycji dopisz wzorzec.
+- Brak planu B: gdy komin lub szczyt dachu są poza kadrem, zasłonięte lub kamera obrócona o > 15°, otworu nie znajdzie. Wzorce pochodzą z jednego dnia (`11-52-43`); inne pory sprawdzono tylko częściowo.
+- Nocą komin widać późno (`05-22-27`: od ok. 1500 s); obniżenie `ANCHOR_MIN_SCORE` do ok. 0,55 dałoby wcześniejsze wykrycie (nie sprawdzono).
 - Okna widoczności otworu krótsze niż 60 s mogą zostać pominięte; bardzo jasna wiewiórka na jasnym tle byłaby pominięta.
 - Krok 4 może gubić przeloty < 0,7 s; `--frame-step 1` łapie więcej zdarzeń granicznych.
 - `--watch` nie obejmuje starszych dni; pomysł: `--since RRRR-MM-DD`.
