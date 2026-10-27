@@ -12,7 +12,7 @@ Przykładowe obrazki dostaniesz... pytanie czy musza to być klatki filmu czy wy
 Kamera może się przesunąć, mogę zadbać by była mniej więcej po środku kadru ale powinna być jakaś korekcja gdyz ptaki na niej siadają i ciut przesuwają, minimalnie ale jednak
 4. **Zacznij od najprostszego wariantu**, zmierz go na próbkach i dopiero potem komplikuj.
 Przygotuję film pokazowy 
-5. **Użyj gotowych elementów** z [squirrel_exit_prototype.py](mcrwac/analysis/squirrel_exit_prototype.py): wybór plików po dacie/godzinach (`select_recordings`, `--date`, `--hours`), `--watch` z listą `analyzed.txt`, klipy ffmpeg, `--frame-step`, logowanie `_log`, wzór usługi [squirrel-analysis.service](systemd/squirrel-analysis.service). Nie przenosić lokalizacji otworu ani wzorców SIFT, jeśli kadr jest inny.
+5. **Użyj gotowych elementów** z [squirrel_exit_prototype.py](mcrwac/analysis/squirrel_exit_prototype.py): wybór plików po dacie/godzinach (`select_recordings`, `--date`, `--hours`), `--watch` z listą `analyzed.txt`, klipy ffmpeg, `--frame-step`, logowanie `_log`, wzór usługi [squirrel-analysis.service](systemd/squirrel-analysis.service). Nie przenosić lokalizacji otworu (trójkąt komin–szczyt dachu i jego wzorce) ani założeń POE_BRAMA, jeśli kadr jest inny.
 6. **Przejrzyj starsze moduły** `adaptive_dark_detector.py`, `blob_detector.py`, `astro_filter.py`, `segment*.py` i `scripts/motion_detect.py`. Mogą już dotyczyć POE1. Ich przydatności nie sprawdzano.
 
 ## Dokumentacja do utworzenia (analogicznie do POE_BRAMA)
