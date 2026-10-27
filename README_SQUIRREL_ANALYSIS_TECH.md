@@ -1,6 +1,6 @@
-# README_2 — część techniczna: analiza wyjścia wiewiórki
+# Część techniczna: analiza wyjścia wiewiórki
 
-Uzupełnienie [README.md](README.md). Opisuje architekturę, stałe z uzasadnieniem, procedurę tworzenia wzorców, formaty plików i ograniczenia, tak aby rozwiązanie dało się odtworzyć od zera.
+Uzupełnienie [README_SQUIRREL_ANALYSIS.md](README_SQUIRREL_ANALYSIS.md). Opisuje architekturę, stałe z uzasadnieniem, procedurę tworzenia wzorców, formaty plików i ograniczenia, tak aby rozwiązanie dało się odtworzyć od zera.
 
 ## 1. Cel i założenia
 
