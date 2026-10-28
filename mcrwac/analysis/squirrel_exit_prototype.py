@@ -81,6 +81,7 @@ DEFAULT_MIN_DIAGONAL_PX = 30.0
 MIN_REGION_SIDE_PX = 12
 MAX_REGION_ASPECT = 6.0
 DEFAULT_ANALYSIS_OUTPUT_DIR = Path("/opt/cameras/recordings/analysis")
+ANALYSIS_SUBDIR = "wiewiorki"
 DEFAULT_CLIP_SECONDS = 180.0
 DEFAULT_FRAME_STEP = 4
 WATCH_POLL_SECONDS = 30.0
@@ -528,6 +529,7 @@ def _timestamped_output_path(
         return (
             DEFAULT_ANALYSIS_OUTPUT_DIR
             / recording_start.strftime("%Y-%m-%d")
+            / ANALYSIS_SUBDIR
             / f"{video_path.stem}_analysis_{timestamp}.mp4"
         )
     return output_path.with_name(
@@ -689,6 +691,7 @@ def analyze_video(
     analyzed_fps = fps / frame_step
     lost_limit = max(1, int(round(analyzed_fps * LOST_TRACKING_SECONDS)))
     opening: Optional[OpeningCandidate] = None
+    last_opening: Optional[OpeningCandidate] = None
     reference_gray: Optional[np.ndarray] = None
     background: Optional[AdaptiveBackground] = None
     lost_frames = 0
@@ -844,6 +847,9 @@ def analyze_video(
         capture.release()
         if writer is not None:
             writer.release()
+        if not save_preview:
+            # Pusty plik rezerwujący nazwę nie jest potrzebny bez podglądu.
+            output_path.unlink(missing_ok=True)
 
     if last_opening is None:
         output_path.unlink(missing_ok=True)
@@ -919,8 +925,10 @@ def select_recordings(
     return [path for _, path in sorted(selected)]
 
 
-def _analyzed_list_path(video_path: Path, analysis_dir: Path) -> Path:
-    return analysis_dir / video_path.parent.name / ANALYZED_LIST_NAME
+def _analyzed_list_path(
+    video_path: Path, analysis_dir: Path, subdir: str = ANALYSIS_SUBDIR
+) -> Path:
+    return analysis_dir / video_path.parent.name / subdir / ANALYZED_LIST_NAME
 
 
 def _load_analyzed(list_path: Path) -> set[str]:
@@ -932,9 +940,12 @@ def _load_analyzed(list_path: Path) -> set[str]:
 
 
 def _mark_analyzed(
-    video_path: Path, status: str, analysis_dir: Path = DEFAULT_ANALYSIS_OUTPUT_DIR
+    video_path: Path,
+    status: str,
+    analysis_dir: Path = DEFAULT_ANALYSIS_OUTPUT_DIR,
+    subdir: str = ANALYSIS_SUBDIR,
 ) -> None:
-    list_path = _analyzed_list_path(video_path, analysis_dir)
+    list_path = _analyzed_list_path(video_path, analysis_dir, subdir)
     list_path.parent.mkdir(parents=True, exist_ok=True)
     with list_path.open("a", encoding="utf-8") as list_file:
         list_file.write(f"{video_path.name}\t{status}\n")
@@ -949,6 +960,7 @@ def next_pending_recording(
     end: Optional[time] = None,
     settle_seconds: float = WATCH_SETTLE_SECONDS,
     analysis_dir: Path = DEFAULT_ANALYSIS_OUTPUT_DIR,
+    subdir: str = ANALYSIS_SUBDIR,
 ) -> Optional[Path]:
     """Zwraca najstarsze zakończone, jeszcze nieanalizowane nagranie.
 
@@ -965,7 +977,9 @@ def next_pending_recording(
         everything = select_recordings(directory)
         if not everything:
             continue
-        analyzed = _load_analyzed(_analyzed_list_path(everything[0], analysis_dir))
+        analyzed = _load_analyzed(
+            _analyzed_list_path(everything[0], analysis_dir, subdir)
+        )
         wanted = set(select_recordings(directory, start, end))
         for path in everything:
             if path not in wanted or path.name in analyzed:
@@ -989,6 +1003,7 @@ def watch_recordings(
     analysis_dir: Path = DEFAULT_ANALYSIS_OUTPUT_DIR,
     clock: Callable[[], datetime] = datetime.now,
     sleep: Callable[[float], None] = _time.sleep,
+    subdir: str = ANALYSIS_SUBDIR,
 ) -> None:
     """Analizuje kolejno każde nowe nagranie zaraz po jego zakończeniu.
 
@@ -1007,6 +1022,7 @@ def watch_recordings(
             end,
             settle_seconds,
             analysis_dir,
+            subdir,
         )
         if video is None:
             sleep(poll_seconds)
@@ -1016,9 +1032,9 @@ def watch_recordings(
             analyze(video)
         except (RuntimeError, OSError, ValueError) as error:
             _log(f"Błąd analizy {video.name}: {error}")
-            _mark_analyzed(video, "blad", analysis_dir)
+            _mark_analyzed(video, "blad", analysis_dir, subdir)
         else:
-            _mark_analyzed(video, "ok", analysis_dir)
+            _mark_analyzed(video, "ok", analysis_dir, subdir)
 
 
 def _terminate(_signum: int, _frame: object) -> None:

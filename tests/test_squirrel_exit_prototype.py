@@ -18,6 +18,7 @@ from mcrwac.analysis.squirrel_exit_prototype import (
     _activity_mask,
     _find_opening,
     _format_elapsed,
+    _analyzed_list_path,
     _load_analyzed,
     _load_anchor_templates,
     _mark_analyzed,
@@ -313,6 +314,18 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         self.assertEqual(first_path.name, "analysis_20261025054902.mp4")
         self.assertEqual(second_path.name, "analysis_20261025054902_02.mp4")
 
+    def test_analyzed_list_subdir_is_configurable(self) -> None:
+        video = Path("/rec/POE1/2026-10-28/05-24-15.mkv")
+
+        self.assertEqual(
+            _analyzed_list_path(video, Path("/a"), "sikorki"),
+            Path("/a/2026-10-28/sikorki/analyzed.txt"),
+        )
+        self.assertEqual(
+            _analyzed_list_path(video, Path("/a")),
+            Path("/a/2026-10-28/wiewiorki/analyzed.txt"),
+        )
+
     def test_default_output_path_is_analysis_directory(self) -> None:
         video_path = Path("/opt/cameras/recordings/CAM/2026-10-25/05-49-02.mkv")
 
@@ -322,7 +335,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
 
         self.assertEqual(
             output_path,
-            Path("/opt/cameras/recordings/analysis/2026-10-25/05-49-02_analysis_20261025054902.mp4"),
+            Path("/opt/cameras/recordings/analysis/2026-10-25/wiewiorki/05-49-02_analysis_20261025054902.mp4"),
         )
 
     def _make_day(self, root: Path, names_ages: dict[str, float], now: float) -> Path:
@@ -350,7 +363,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             self.assertEqual(first.name, "13-00-00.mkv")
 
             _mark_analyzed(first, "ok", analysis)
-            self.assertEqual(_load_analyzed(analysis / "2026-10-27" / "analyzed.txt"),
+            self.assertEqual(_load_analyzed(analysis / "2026-10-27" / "wiewiorki" / "analyzed.txt"),
                              {"13-00-00.mkv"})
             self.assertIsNone(
                 next_pending_recording(camera_dir, day, day, now, analysis_dir=analysis)
@@ -405,7 +418,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                     clock=lambda: now, sleep=stop,
                 )
 
-            lines = (analysis / "2026-10-27" / "analyzed.txt").read_text().splitlines()
+            lines = (analysis / "2026-10-27" / "wiewiorki" / "analyzed.txt").read_text().splitlines()
 
         self.assertEqual(analyzed, ["10-00-00.mkv", "10-30-00.mkv", "11-00-00.mkv"])
         self.assertEqual(

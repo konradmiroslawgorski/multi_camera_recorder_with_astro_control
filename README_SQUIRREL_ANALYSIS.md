@@ -132,7 +132,7 @@ analiza przechodzi przez północ. `--hours` ogranicza zakres godzin każdego dn
 Proces ma obniżony priorytet (`--nice`, domyślnie 10), by nie dławić
 rejestratora.
 
-Lista przeanalizowanych plików to `analysis/RRRR-MM-DD/analyzed.txt` (nazwa i
+Lista przeanalizowanych plików to `analysis/RRRR-MM-DD/wiewiorki/analyzed.txt` (nazwa i
 `ok` albo `blad`); wpisuje ją też zwykłe uruchomienie `--date`/plik bez
 `--output`. Wpis chroni przed ponowną analizą — aby powtórzyć plik, usuń jego
 wiersz. Plik z błędem trafia do listy jako `blad` i nie jest ponawiany.
@@ -161,7 +161,7 @@ jeden klip na plik.
 ### Pliki wynikowe
 
 Wszystko trafia domyślnie do podkatalogu z datą nagrania,
-`/opt/cameras/recordings/analysis/RRRR-MM-DD/` (np. `analysis/2026-10-26/`;
+`/opt/cameras/recordings/analysis/RRRR-MM-DD/wiewiorki/` (np. `analysis/2026-10-26/`;
 tworzony automatycznie), a nazwy mają postać
 `<nazwa nagrania>_<...>_RRRRMMDDGGMMSS`:
 

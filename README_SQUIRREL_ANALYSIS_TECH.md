@@ -7,7 +7,7 @@ Uzupełnienie [README_SQUIRREL_ANALYSIS.md](README_SQUIRREL_ANALYSIS.md). Opisuj
 - Kamera POE_BRAMA (2304×1296, 12 kl./s) nagrywa ścianę z małym otworem (ok. 10×15 px). Wiewiórka wychodzi z otworu.
 - Analiza jest **offline** (po nagraniu), nie wpływa na rejestrator. Wynik: klipy 3 min od wykrycia, CSV, lista przeanalizowanych plików.
 - Wymagania: Python 3.10, `numpy`, `opencv-python`, `ffmpeg` w PATH (klipy), `pip install -r requirements.txt` do `venv_motion`.
-- Nagrania: `/opt/cameras/recordings/<KAMERA>/RRRR-MM-DD/GG-MM-SS.mkv` (czas startu w nazwie, segmenty ok. 30 min). Wyniki: `/opt/cameras/recordings/analysis/RRRR-MM-DD/`.
+- Nagrania: `/opt/cameras/recordings/<KAMERA>/RRRR-MM-DD/GG-MM-SS.mkv` (czas startu w nazwie, segmenty ok. 30 min). Wyniki: `/opt/cameras/recordings/analysis/RRRR-MM-DD/wiewiorki/`.
 - Kamera po restarcie zmienia położenie (25.10 otwór ≈ (999, 793); 26–27.10 ≈ (347, 744)), a światło zmienia się od pochmurnego po pełne słońce i błękitne niebo. Stąd lokalizacja otworu na każdym pliku, nie stałe współrzędne.
 
 ## 2. Architektura (`mcrwac/analysis/squirrel_exit_prototype.py`)
