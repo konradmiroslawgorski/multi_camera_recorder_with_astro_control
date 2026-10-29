@@ -38,7 +38,7 @@ Kamera może się przesunąć, mogę zadbać by była mniej więcej po środku k
      Otrzymasz `/tmp/poe1-review.csv` i `/tmp/poe1-review_events.csv`.
      Po wykryciu spójnej grupy zmian (przerwa krótsza niż 0,25 s) analiza
      wstrzymuje skanowanie, zapisuje klip od 1 s przed szczytem zmiany do 5 s
-     po nim, a potem kontynuuje. Wyniki z opóźnień 1/3/5 klatek w tej samej
+     po nim, a potem kontynuuje. Wyniki z opóźnień 1/3 klatek w tej samej
      grupie dają jeden klip. Domyślny katalog to
      `/opt/cameras/recordings/analysis/<data-z-katalogu-nagrania>/sikorki/`; można go
      zmienić przez `--clips-dir`. Klip trwa domyślnie 6 s (1 s przed + 5 s po
@@ -49,7 +49,7 @@ Kamera może się przesunąć, mogę zadbać by była mniej więcej po środku k
      oznacza 7 min 4 s nagrania.
      W wierszu zdarzenia są czas początku/końca względem pliku, czas
      największej zmiany, rozmiar największego obszaru i liczba zmienionych
-     pikseli. `--lags 1 3 5` można zmienić; czasy są sekundami od początku
+     pikseli. `--lags 1 3` (domyślnie; np. `--lags 1 3 5` daje czulszy, wolniejszy wariant); czasy są sekundami od początku
      nagrania. Współrzędne wielokąta można podać jawnie przez
      `--polygon x1 y1 x2 y2 x3 y3 ...`; domyślnie używany jest obrys powyżej.
      Aby po kolei przetworzyć wszystkie pliki MKV z katalogu, podaj katalog
