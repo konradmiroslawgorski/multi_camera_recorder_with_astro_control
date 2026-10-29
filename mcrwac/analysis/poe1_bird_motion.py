@@ -351,6 +351,7 @@ def measure_difference(
     thresholds: Sequence[int] = DEFAULT_THRESHOLDS,
     component_threshold: int = 20,
     mask: np.ndarray | None = None,
+    min_component_px: int = 0,
 ) -> MotionMetrics:
     """Measure pixel-wise grayscale change and the largest connected change."""
     if previous_gray.shape != current_gray.shape:
@@ -360,8 +361,34 @@ def measure_difference(
     if mask is not None and mask.shape != previous_gray.shape:
         raise ValueError("Mask must have the same dimensions as frames")
 
-    previous = cv2.GaussianBlur(previous_gray, (3, 3), 0)
-    current = cv2.GaussianBlur(current_gray, (3, 3), 0)
+    return measure_blurred_difference(
+        blur_gray(previous_gray),
+        blur_gray(current_gray),
+        thresholds,
+        component_threshold,
+        mask,
+        min_component_px,
+    )
+
+
+def blur_gray(gray: np.ndarray) -> np.ndarray:
+    return cv2.GaussianBlur(gray, (3, 3), 0)
+
+
+def measure_blurred_difference(
+    previous: np.ndarray,
+    current: np.ndarray,
+    thresholds: Sequence[int] = DEFAULT_THRESHOLDS,
+    component_threshold: int = 20,
+    mask: np.ndarray | None = None,
+    min_component_px: int = 0,
+) -> MotionMetrics:
+    """Like measure_difference for frames that are already blurred.
+
+    The connected-component pass is skipped (largest component reported as 0)
+    when fewer than `min_component_px` pixels exceed the component threshold,
+    since no component can then reach that size.
+    """
     difference = cv2.absdiff(previous, current)
     if mask is not None:
         difference = cv2.bitwise_and(difference, difference, mask=mask)
@@ -372,13 +399,15 @@ def measure_difference(
     component_mask = cv2.compare(
         difference, component_threshold, cv2.CMP_GT
     )
-    count, _, stats, _ = cv2.connectedComponentsWithStats(
-        component_mask, connectivity=8
-    )
-    largest_component = max(
-        (int(stats[index, cv2.CC_STAT_AREA]) for index in range(1, count)),
-        default=0,
-    )
+    largest_component = 0
+    if min_component_px <= 0 or cv2.countNonZero(component_mask) >= min_component_px:
+        count, _, stats, _ = cv2.connectedComponentsWithStats(
+            component_mask, connectivity=8
+        )
+        largest_component = max(
+            (int(stats[index, cv2.CC_STAT_AREA]) for index in range(1, count)),
+            default=0,
+        )
     return MotionMetrics(
         mean_abs_difference=float(
             np.mean(difference if mask is None else difference[mask > 0])
@@ -541,13 +570,16 @@ def analyze_video(
                     flush_active_candidate()
                     range_end_frame = frame_index
                     continue
-                gray = to_roi_gray(frame)
+                gray = blur_gray(to_roi_gray(frame))
                 row: list[float | int] = [frame_index, frame_index / fps]
                 frame_candidates: list[tuple[int, MotionMetrics]] = []
                 for lag in lags:
                     if len(history) >= lag:
-                        metrics = measure_difference(
-                            history[-lag], gray, mask=polygon_mask
+                        metrics = measure_blurred_difference(
+                            history[-lag],
+                            gray,
+                            mask=polygon_mask,
+                            min_component_px=min_component_px,
                         )
                         if metrics.largest_component >= min_component_px:
                             candidates_by_lag[lag].append(
