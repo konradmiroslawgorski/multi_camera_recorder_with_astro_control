@@ -227,10 +227,10 @@ class Poe1BirdMotionTests(unittest.TestCase):
             names = sorted(path.name for path in clips.glob("*_candidate_*"))
             self.assertEqual(len(names), 2, names)
 
-    def test_default_clip_is_six_seconds_with_3s_skip(self) -> None:
+    def test_default_clip_is_three_seconds_with_3s_skip(self) -> None:
         self.assertEqual(DEFAULT_SKIP_AFTER_SECONDS, 3.0)
         self.assertEqual(
-            DEFAULT_CLIP_BEFORE_SECONDS + DEFAULT_CLIP_AFTER_SECONDS, 6.0
+            DEFAULT_CLIP_BEFORE_SECONDS + DEFAULT_CLIP_AFTER_SECONDS, 3.0
         )
 
 

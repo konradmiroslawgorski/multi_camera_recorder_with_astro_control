@@ -41,7 +41,7 @@ Kamera może się przesunąć, mogę zadbać by była mniej więcej po środku k
      po nim, a potem kontynuuje. Wyniki z opóźnień 1/3 klatek w tej samej
      grupie dają jeden klip. Domyślny katalog to
      `/opt/cameras/recordings/analysis/<data-z-katalogu-nagrania>/sikorki/`; można go
-     zmienić przez `--clips-dir`. Klip trwa domyślnie 6 s (1 s przed + 5 s po
+     zmienić przez `--clips-dir`. Klip trwa domyślnie 3 s (1 s przed + 2 s po
      szczycie; `--clip-before`, `--clip-after`). Po zapisaniu klipu analiza
      pomija kolejne 3 s (`--skip-after`), żeby sąsiednie klipy nie pokazywały
      tych samych momentów. Nazwa klipu zawiera czas zdarzenia relatywny od początku
