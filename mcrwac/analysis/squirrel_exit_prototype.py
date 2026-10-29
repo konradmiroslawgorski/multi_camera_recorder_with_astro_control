@@ -961,6 +961,7 @@ def next_pending_recording(
     settle_seconds: float = WATCH_SETTLE_SECONDS,
     analysis_dir: Path = DEFAULT_ANALYSIS_OUTPUT_DIR,
     subdir: str = ANALYSIS_SUBDIR,
+    newest_day_first: bool = False,
 ) -> Optional[Path]:
     """Zwraca najstarsze zakończone, jeszcze nieanalizowane nagranie.
 
@@ -968,10 +969,12 @@ def next_pending_recording(
     zamknął poprzedni segment) albo gdy nie był zapisywany od `settle_seconds`
     (nagrywanie zatrzymane, np. wieczorem przez astro).
     """
-    current = first_date
-    while current <= last_date:
+    day_count = (last_date - first_date).days + 1
+    days = [first_date + timedelta(days=offset) for offset in range(day_count)]
+    if newest_day_first:
+        days.reverse()
+    for current in days:
         directory = camera_dir / current.isoformat()
-        current += timedelta(days=1)
         if not directory.is_dir():
             continue
         everything = select_recordings(directory)
@@ -1004,13 +1007,15 @@ def watch_recordings(
     clock: Callable[[], datetime] = datetime.now,
     sleep: Callable[[float], None] = _time.sleep,
     subdir: str = ANALYSIS_SUBDIR,
+    first_date: Optional[date] = None,
+    newest_day_first: bool = False,
 ) -> None:
     """Analizuje kolejno każde nowe nagranie zaraz po jego zakończeniu.
 
     Śledzi dni od uruchomienia do bieżącego, więc zaległości po północy też
     zostaną nadrobione. Błąd jednego pliku nie zatrzymuje kolejki.
     """
-    first_date = clock().date()
+    first_date = first_date or clock().date()
     while True:
         now = clock()
         video = next_pending_recording(
@@ -1023,6 +1028,7 @@ def watch_recordings(
             settle_seconds,
             analysis_dir,
             subdir,
+            newest_day_first,
         )
         if video is None:
             sleep(poll_seconds)

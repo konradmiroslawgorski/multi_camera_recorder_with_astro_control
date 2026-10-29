@@ -347,6 +347,28 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             os.utime(path, (now - age, now - age))
         return root / "cam"
 
+    def test_next_pending_can_prefer_newest_day(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = 2_000_000_000.0
+            for day_name in ("2026-10-28", "2026-10-29"):
+                day = root / "cam" / day_name
+                day.mkdir(parents=True)
+                for name in ("05-00-00.mkv", "05-30-00.mkv"):
+                    path = day / name
+                    path.touch()
+                    os.utime(path, (now - 9999, now - 9999))
+            args = (root / "cam", date(2026, 10, 28), date(2026, 10, 29), now)
+            analysis = root / "analysis"
+
+            oldest = next_pending_recording(*args, analysis_dir=analysis)
+            newest = next_pending_recording(
+                *args, analysis_dir=analysis, newest_day_first=True
+            )
+
+            self.assertEqual(oldest.parent.name, "2026-10-28")
+            self.assertEqual(newest, root / "cam" / "2026-10-29" / "05-00-00.mkv")
+
     def test_next_pending_skips_file_still_being_recorded(self) -> None:
         now = 1_800_000_000.0
         with TemporaryDirectory() as directory:

@@ -688,6 +688,7 @@ def run_watch(
     noise_filter: bool,
     poll_seconds: float,
     skip_after: float,
+    days_back: int = 1,
 ) -> None:
     """Analyze each finished recording once, tracked in sikorki/analyzed.txt."""
     from mcrwac.analysis import squirrel_exit_prototype as watcher
@@ -719,6 +720,8 @@ def run_watch(
             analyze,
             poll_seconds=poll_seconds,
             subdir=ANALYSIS_SUBDIR,
+            first_date=date.today() - timedelta(days=days_back),
+            newest_day_first=True,
         )
     except KeyboardInterrupt:
         print("Interrupted", flush=True)
@@ -788,6 +791,13 @@ def main() -> None:
     )
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument(
+        "--days-back",
+        type=int,
+        default=1,
+        help="--watch also catches up unanalyzed recordings from N earlier "
+        "days; the newest day is always processed first",
+    )
+    parser.add_argument(
         "--no-noise-filter",
         action="store_true",
         help="analyze whole files even when the image is full of sensor snow",
@@ -811,6 +821,7 @@ def main() -> None:
             not args.no_noise_filter,
             args.poll_seconds,
             args.skip_after,
+            args.days_back,
         )
         return
     if args.video is None:
