@@ -3,6 +3,7 @@
 # ===== CONFIG =====
 CHECK_PATH="/opt"
 RECORDINGS_PATH="/opt/cameras/recordings"
+CAMERA_NAMES=("POE1" "POE_BRAMA")
 LOGFILE="/home/ubuntu/disk_monitor.log"
 STATEFILE="/home/ubuntu/.disk_state"
 EMAIL="konrad.gorski@rcafe.pl"
@@ -39,7 +40,17 @@ clear_mail_state() {
 }
 
 prune_oldest_day() {
-    oldest=$(find "$RECORDINGS_PATH" -mindepth 2 -maxdepth 2 -type d | sort | head -n 1)
+    local camera_paths=()
+    local camera
+    local oldest
+
+    for camera in "${CAMERA_NAMES[@]}"; do
+        camera_paths+=("$RECORDINGS_PATH/$camera")
+    done
+
+    oldest=$(find "${camera_paths[@]}" -mindepth 1 -maxdepth 1 -type d \
+        -regextype posix-extended -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}' \
+        -printf '%f\t%p\n' | sort -t $'\t' -k1,1 -k2,2 | head -n 1 | cut -f2-)
 
     if [ -z "$oldest" ]; then
         return 1
