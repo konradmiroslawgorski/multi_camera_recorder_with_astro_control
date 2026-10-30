@@ -42,21 +42,26 @@ clear_mail_state() {
 prune_oldest_day() {
     local camera_paths=()
     local camera
+    local oldest_entry
+    local oldest_date
     local oldest
 
     for camera in "${CAMERA_NAMES[@]}"; do
         camera_paths+=("$RECORDINGS_PATH/$camera")
     done
 
-    oldest=$(find "${camera_paths[@]}" -mindepth 1 -maxdepth 1 -type d \
+    oldest_entry=$(find "${camera_paths[@]}" -mindepth 1 -maxdepth 1 -type d \
         -regextype posix-extended -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}' \
-        -printf '%f\t%p\n' | sort -t $'\t' -k1,1 -k2,2 | head -n 1 | cut -f2-)
+        -printf '%f\t%p\n' | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 | head -n 1)
 
-    if [ -z "$oldest" ]; then
+    if [ -z "$oldest_entry" ]; then
         return 1
     fi
 
-    log "[PRUNE] Removing $oldest"
+    oldest_date=${oldest_entry%%$'\t'*}
+    oldest=${oldest_entry#*$'\t'}
+
+    log "[PRUNE] Removing oldest recording day $oldest_date: $oldest"
     rm -rf "$oldest"
     return 0
 }
