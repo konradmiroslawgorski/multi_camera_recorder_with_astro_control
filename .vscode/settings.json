@@ -3,6 +3,10 @@
     "chat.tools.terminal.autoApprove": {
         "ffprobe": true,
         "mkdir": true,
-        "ffmpeg": true
+        "ffmpeg": true,
+        "systemctl status": true,
+        "journalctl": true,
+        "git status": true,
+        "git diff": true
     }
 }
