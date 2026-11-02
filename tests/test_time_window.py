@@ -53,10 +53,20 @@ class RecordingWindowTests(unittest.TestCase):
             "lower_half",
         )
 
-        self.assertIn("crop=iw:ih/2:0:ih/2", command)
+        video_filter = command[command.index("-vf") + 1]
+        self.assertTrue(video_filter.startswith("crop=iw:ih/2:0:ih/2,"))
+        self.assertIn("drawtext", video_filter)
         self.assertIn("libx264", command)
         self.assertEqual(command[command.index("-segment_time") + 1], "1800")
         self.assertEqual(command[-1], "/recordings/%Y-%m-%d/%H-%M-%S.mkv")
+
+    def test_ffmpeg_command_without_crop_copies_streams_untouched(self) -> None:
+        command = _ffmpeg_command(
+            "rtsp://camera/stream", "1800", "/recordings/%H-%M-%S.mkv", ""
+        )
+
+        self.assertNotIn("-vf", command)
+        self.assertEqual(command[command.index("-c") + 1], "copy")
 
 
 if __name__ == "__main__":

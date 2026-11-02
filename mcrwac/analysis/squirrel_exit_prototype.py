@@ -62,6 +62,7 @@ RIDGE_ANCHOR = AnchorSpec("poe_brama_ridge.png", (610, 515), (666.0, 555.0))
 REFERENCE_OPENING = (347.0, 744.0)
 ANCHOR_SCALES = tuple(np.arange(0.85, 1.19, 0.03))
 ANCHOR_MIN_SCORE = 0.58
+ANCHOR_HINT_MIN_SCORE = 0.50
 TRIANGLE_MIN_SCALE = 0.85
 TRIANGLE_MAX_SCALE = 1.18
 TRIANGLE_MAX_ANGLE_DEG = 15.0
@@ -81,7 +82,7 @@ DEFAULT_MIN_DIAGONAL_PX = 30.0
 MIN_REGION_SIDE_PX = 12
 MAX_REGION_ASPECT = 6.0
 DEFAULT_ANALYSIS_OUTPUT_DIR = Path("/opt/cameras/recordings/analysis")
-ANALYSIS_SUBDIR = "wiewiorki"
+ANALYSIS_SUBDIR = "POE_BRAMA_wiewiorki"
 DEFAULT_CLIP_SECONDS = 180.0
 DEFAULT_FRAME_STEP = 4
 WATCH_POLL_SECONDS = 30.0
@@ -101,6 +102,14 @@ RELEASE_GAP_SECONDS = 1.5
 SEARCH_RETRY_SECONDS = 15.0
 SEARCH_GRID_SECONDS = 60.0
 LOST_TRACKING_SECONDS = 15.0
+ANCHOR_SEARCH_RADIUS_PX = 120.0
+SIZE_SAMPLE_SECONDS = 10.0
+SIZE_HISTORY_SAMPLES = 30
+SIZE_MIN_HISTORY = 6
+SIZE_WINDOW_HALF_WIDTH = 22
+SIZE_WINDOW_HALF_HEIGHT = 30
+SIZE_MIN_DARK_PX = 150
+SIZE_GROWTH_FACTOR = 2.5
 
 
 def _sample_calibration_frames(
@@ -164,13 +173,29 @@ def _load_anchor_templates() -> Optional[tuple[_AnchorTemplate, _AnchorTemplate]
 
 
 def _find_anchor(
-    edges: np.ndarray, template: _AnchorTemplate
+    edges: np.ndarray,
+    template: _AnchorTemplate,
+    expected: Optional[tuple[float, float]] = None,
+    radius: float = ANCHOR_SEARCH_RADIUS_PX,
 ) -> tuple[float, np.ndarray]:
+    """Najlepsze dopasowanie wzorca; z `expected` tylko w promieniu od oczekiwanego punktu."""
     best_score, best_point = -1.0, np.zeros(2)
     for scale, scaled in template.scaled:
         if scaled.shape[0] > edges.shape[0] or scaled.shape[1] > edges.shape[1]:
             continue
         result = cv2.matchTemplate(edges, scaled, cv2.TM_CCOEFF_NORMED)
+        if expected is not None:
+            center_x = expected[0] - template.offset[0] * scale
+            center_y = expected[1] - template.offset[1] * scale
+            left = max(0, int(center_x - radius))
+            top = max(0, int(center_y - radius))
+            right = int(center_x + radius) + 1
+            bottom = int(center_y + radius) + 1
+            if left >= result.shape[1] or top >= result.shape[0] or right <= 0 or bottom <= 0:
+                continue
+            restricted = np.full_like(result, -1.0)
+            restricted[top:bottom, left:right] = result[top:bottom, left:right]
+            result = restricted
         _, score, _, location = cv2.minMaxLoc(result)
         if score > best_score:
             best_score = float(score)
@@ -209,11 +234,24 @@ def _estimate_opening(
     frame: np.ndarray, templates: tuple[_AnchorTemplate, _AnchorTemplate]
 ) -> Optional[tuple[float, float]]:
     edges = _prepare_for_matching(frame)
-    chimney_score, chimney = _find_anchor(edges, templates[0])
-    ridge_score, ridge = _find_anchor(edges, templates[1])
-    if min(chimney_score, ridge_score) < ANCHOR_MIN_SCORE:
-        return None
-    return _opening_from_triangle(chimney, ridge, frame.shape)
+    # Najpierw blisko wzorcowych położeń (kamera prawie się nie rusza); słabe
+    # dopasowanie bywa inaczej przechwytywane przez drzewo w innym miejscu kadru.
+    for chimney_hint, ridge_hint, min_score in (
+        (
+            tuple(map(float, CHIMNEY_ANCHOR.anchor)),
+            tuple(map(float, RIDGE_ANCHOR.anchor)),
+            ANCHOR_HINT_MIN_SCORE,
+        ),
+        (None, None, ANCHOR_MIN_SCORE),
+    ):
+        chimney_score, chimney = _find_anchor(edges, templates[0], chimney_hint)
+        ridge_score, ridge = _find_anchor(edges, templates[1], ridge_hint)
+        if min(chimney_score, ridge_score) < min_score:
+            continue
+        opening = _opening_from_triangle(chimney, ridge, frame.shape)
+        if opening is not None:
+            return opening
+    return None
 
 
 def _probe_reference(capture: cv2.VideoCapture, frame_index: int) -> bool:
@@ -501,6 +539,59 @@ class AppearanceDetector:
         return Appearance(start_frame=positive_frames[0])
 
 
+class OpeningSizeDetector:
+    """Wykrywa powolną wiewiórkę przez rzadki pomiar „wielkości dziury”.
+
+    Co SIZE_SAMPLE_SECONDS liczy ciemne piksele w małym oknie wokół otworu
+    względem mediany ostatnich próbek (ok. 5 min). Zdarzenie, gdy ich liczba jest
+    co najmniej SIZE_GROWTH_FACTOR razy większa niż zwykle i nie mniejsza niż
+    SIZE_MIN_DARK_PX. Łapie wiewiórkę, która rusza się zbyt wolno dla porównania
+    klatek z tłem adaptacyjnym albo jest mała.
+    """
+
+    def __init__(self, fps: float):
+        self._sample_frames = max(1, int(round(fps * SIZE_SAMPLE_SECONDS)))
+        self._next_sample_frame = 0
+        self._history: deque[np.ndarray] = deque(maxlen=SIZE_HISTORY_SAMPLES)
+        self._counts: deque[int] = deque(maxlen=SIZE_HISTORY_SAMPLES)
+        self._active = False
+
+    def update(
+        self, frame_index: int, frame: np.ndarray, x: int, y: int
+    ) -> Optional[Appearance]:
+        if frame_index < self._next_sample_frame:
+            return None
+        self._next_sample_frame = frame_index + self._sample_frames
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        x1, x2 = x - SIZE_WINDOW_HALF_WIDTH, x + SIZE_WINDOW_HALF_WIDTH
+        y1, y2 = y - SIZE_WINDOW_HALF_HEIGHT, y + SIZE_WINDOW_HALF_HEIGHT
+        if x1 < 0 or y1 < 0 or x2 > gray.shape[1] or y2 > gray.shape[0]:
+            return None
+        window = gray[y1:y2, x1:x2].astype(np.float32)
+        appearance: Optional[Appearance] = None
+        if len(self._history) >= SIZE_MIN_HISTORY:
+            background = np.median(np.stack(self._history), axis=0)
+            difference = background - window
+            difference -= np.median(difference)
+            count = int(
+                ((difference > 25) & (window < MIN_DARKENING_RATIO * background)).sum()
+            )
+            usual = float(np.median(self._counts)) if self._counts else 0.0
+            enlarged = count >= max(SIZE_MIN_DARK_PX, SIZE_GROWTH_FACTOR * usual)
+            if enlarged and not self._active:
+                appearance = Appearance(start_frame=frame_index)
+            if enlarged:
+                # Powiększona dziura nie zawyża „zwykłego” poziomu.
+                self._active = True
+            else:
+                self._active = False
+                self._counts.append(count)
+            if enlarged:
+                return appearance
+        self._history.append(window)
+        return appearance
+
+
 def _format_elapsed(seconds: float) -> str:
     total_milliseconds = max(0, int(round(seconds * 1000)))
     hours, remainder = divmod(total_milliseconds, 3_600_000)
@@ -686,6 +777,7 @@ def analyze_video(
     csv_path = output_path.with_suffix(".csv")
     frame_index = 0
     detector = AppearanceDetector(fps, frame_step)
+    size_detector = OpeningSizeDetector(fps)
     appearances: list[Appearance] = []
     retry_frames = max(1, int(round(fps * SEARCH_RETRY_SECONDS)))
     analyzed_fps = fps / frame_step
@@ -728,6 +820,7 @@ def analyze_video(
                     background = _reference_window(reference_gray, opening)
                     lost_frames = 0
                     detector = AppearanceDetector(fps, frame_step)
+                    size_detector = OpeningSizeDetector(fps)
                     capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                     _log(
                         f"[{_format_elapsed(frame_index / fps)}] Otwór widoczny: "
@@ -754,6 +847,18 @@ def analyze_video(
                     if background is not None and bounds is not None:
                         _update_background(background, frame, bounds, mask, analyzed_fps)
                 appearance = detector.update(frame_index, bool(regions))
+                if mask is not None:
+                    size_appearance = size_detector.update(
+                        frame_index, frame, tracked.x, tracked.y
+                    )
+                    recent_start = (
+                        appearances[-1].start_frame if appearances else None
+                    )
+                    if appearance is None and size_appearance is not None and (
+                        recent_start is None
+                        or frame_index - recent_start > fps * clip_seconds
+                    ):
+                        appearance = size_appearance
                 if appearance is not None:
                     appearances.append(appearance)
                 timestamp = frame_index / fps
@@ -951,6 +1056,100 @@ def _mark_analyzed(
         list_file.write(f"{video_path.name}\t{status}\n")
 
 
+def day_result_path(day_directory: Path) -> Path:
+    return day_directory / f"result_{day_directory.parent.name.replace('-', '_')}.mkv"
+
+
+def _day_clips(day_directory: Path) -> list[Path]:
+    """Klipy dnia w kolejności czasu (nazwy zaczynają się od HH-MM-SS)."""
+    result = day_result_path(day_directory)
+    return sorted(
+        path
+        for path in day_directory.glob("*.mkv")
+        if path != result and not path.name.startswith(".")
+    )
+
+
+def build_day_result(day_directory: Path) -> Optional[Path]:
+    """Skleja wszystkie klipy dnia w jeden plik result_RRRR_MM_DD.mkv.
+
+    `day_directory` to katalog typu analysis/RRRR-MM-DD/<subdir>. Zwraca None,
+    gdy nie ma klipów. Najpierw kopiuje strumienie, a przy błędzie koduje ponownie.
+    """
+    clips = _day_clips(day_directory)
+    if not clips:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("Nie znaleziono ffmpeg wymaganego do sklejenia klipów.")
+    result = day_result_path(day_directory)
+    list_path = day_directory / ".result-list.txt"
+    temporary = day_directory / ".result-tmp.mkv"
+    list_path.write_text(
+        "".join(
+            "file '" + str(clip.resolve()).replace("'", "'\\''") + "'\n"
+            for clip in clips
+        ),
+        encoding="utf-8",
+    )
+    try:
+        last_error = ""
+        for codec_args in (
+            ["-c", "copy"],
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac"],
+        ):
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0", "-i", str(list_path),
+                "-map", "0:v:0", "-map", "0:a?", *codec_args,
+                "-y", str(temporary),
+            ]
+            outcome = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+            if outcome.returncode == 0:
+                os.replace(temporary, result)
+                return result
+            last_error = outcome.stderr.strip()
+        raise RuntimeError(f"ffmpeg nie skleił klipów do {result}: {last_error}")
+    finally:
+        temporary.unlink(missing_ok=True)
+        list_path.unlink(missing_ok=True)
+
+
+def update_day_results(
+    camera_dir: Path,
+    first_date: date,
+    last_date: date,
+    analysis_dir: Path,
+    subdir: str,
+    failed: set[tuple[str, float]],
+) -> None:
+    """Tworzy/odświeża result_* dla każdego dnia, który ma nowsze klipy."""
+    for offset in range((last_date - first_date).days + 1):
+        current = first_date + timedelta(days=offset)
+        day_directory = analysis_dir / current.isoformat() / subdir
+        if not day_directory.is_dir():
+            continue
+        clips = _day_clips(day_directory)
+        if not clips:
+            continue
+        newest = max(clip.stat().st_mtime for clip in clips)
+        result = day_result_path(day_directory)
+        if result.exists() and result.stat().st_mtime >= newest:
+            continue
+        key = (str(day_directory), newest)
+        if key in failed:
+            continue
+        try:
+            build_day_result(day_directory)
+        except (RuntimeError, OSError) as error:
+            failed.add(key)
+            _log(f"Błąd składania {result.name}: {error}")
+        else:
+            _log(f"Zapisano {result} ({len(clips)} klipów)")
+
+
 def next_pending_recording(
     camera_dir: Path,
     first_date: date,
@@ -1016,6 +1215,7 @@ def watch_recordings(
     zostaną nadrobione. Błąd jednego pliku nie zatrzymuje kolejki.
     """
     first_date = first_date or clock().date()
+    failed_results: set[tuple[str, float]] = set()
     while True:
         now = clock()
         video = next_pending_recording(
@@ -1030,6 +1230,9 @@ def watch_recordings(
             subdir,
             newest_day_first,
         )
+        update_day_results(
+            camera_dir, first_date, now.date(), analysis_dir, subdir, failed_results
+        )
         if video is None:
             sleep(poll_seconds)
             continue
@@ -1041,6 +1244,9 @@ def watch_recordings(
             _mark_analyzed(video, "blad", analysis_dir, subdir)
         else:
             _mark_analyzed(video, "ok", analysis_dir, subdir)
+        update_day_results(
+            camera_dir, first_date, clock().date(), analysis_dir, subdir, failed_results
+        )
 
 
 def _terminate(_signum: int, _frame: object) -> None:
@@ -1182,6 +1388,11 @@ def main() -> None:
                 frame_step=args.frame_step,
             )
 
+        from mcrwac.notify import build_service_notifier
+
+        notifier = build_service_notifier(f"{args.camera} wiewiorki")
+        notifier.event("start analizy", title="Start", tags="red_circle")
+        stop_reason = "zatrzymanie uslugi"
         try:
             watch_recordings(
                 camera_dir,
@@ -1192,6 +1403,18 @@ def main() -> None:
             )
         except KeyboardInterrupt:
             _log("Przerwano.")
+        except SystemExit:
+            raise
+        except BaseException as error:
+            stop_reason = f"blad: {type(error).__name__}: {error}"
+            raise
+        finally:
+            notifier.event(
+                f"stop analizy ({stop_reason})",
+                title="Stop",
+                tags="black_square_for_stop",
+            )
+            notifier.close()
         return
 
     if args.video is not None:

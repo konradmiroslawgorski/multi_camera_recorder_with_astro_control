@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import math
 import os
 import re
 import shutil
@@ -19,14 +20,18 @@ import cv2
 import numpy as np
 
 
-DEFAULT_POLYGON = ((830, 481), (1005, 435), (1108, 865), (947, 909))
+DEFAULT_POLYGON = ((830, 481), (986, 440), (1082, 853), (947, 909))
 DEFAULT_LAGS = (1, 3)
 DEFAULT_THRESHOLDS = (12, 20, 32)
 DEFAULT_CLIP_BEFORE_SECONDS = 1.0
 DEFAULT_CLIP_AFTER_SECONDS = 2.0
 DEFAULT_SKIP_AFTER_SECONDS = 3.0
 DEFAULT_ANALYSIS_ROOT = Path("/opt/cameras/recordings/analysis")
-ANALYSIS_SUBDIR = "sikorki"
+ANALYSIS_SUBDIR = "POE1_sikorki"
+MAX_CHANGED_PIXELS = 5000
+MIN_CHANGED_PIXELS_FOR_COHERENCE = 500
+MIN_COHERENT_FRACTION = 0.35
+MAX_COHERENT_COMPONENT_PIXELS = 2000
 DEFAULT_LOCATION_CONFIG = (
     Path(__file__).resolve().parents[2] / "config" / "recording_config.yaml"
 )
@@ -133,6 +138,124 @@ def find_clean_ranges(
     return clean_ranges
 
 
+def video_duration_seconds(video_path: Path) -> float:
+    """Read container duration; OpenCV's reported frame count may be inaccurate."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        raise RuntimeError("ffprobe is required to read recording duration")
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe failed for {video_path}: {result.stderr.strip()}"
+        )
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError as error:
+        raise RuntimeError(
+            f"ffprobe returned an invalid duration for {video_path}: "
+            f"{result.stdout.strip()!r}"
+        ) from error
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError(
+            f"ffprobe returned a non-positive duration for {video_path}: "
+            f"{duration}"
+        )
+    return duration
+
+
+def read_timed_frame(
+    capture: cv2.VideoCapture, video_path: Path
+) -> tuple[float, np.ndarray] | None:
+    """Read one frame and return its presentation timestamp in seconds."""
+    ok, frame = capture.read()
+    if not ok:
+        return None
+    timestamp_ms = capture.get(cv2.CAP_PROP_POS_MSEC)
+    if not math.isfinite(timestamp_ms) or timestamp_ms < 0:
+        raise RuntimeError(
+            f"Invalid frame timestamp in {video_path}: {timestamp_ms}"
+        )
+    return timestamp_ms / 1000.0, frame
+
+
+def sample_noise_fractions(
+    video_path: Path,
+    duration_seconds: float,
+    polygon_mask: np.ndarray,
+    to_roi_gray: Callable[[np.ndarray], np.ndarray],
+) -> list[float]:
+    """Sample adjacent-frame change every 0.4 s using sequential PTS reads."""
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Cannot open video for noise scan: {video_path}")
+
+    fractions: list[float] = []
+    current = read_timed_frame(capture, video_path)
+    sample_time = 0.0
+    last_timestamp = -1.0
+    try:
+        while current is not None and sample_time < duration_seconds:
+            while current is not None and current[0] < sample_time:
+                if current[0] < last_timestamp:
+                    raise RuntimeError(
+                        f"Non-monotonic frame timestamps in {video_path}"
+                    )
+                last_timestamp = current[0]
+                current = read_timed_frame(capture, video_path)
+            if current is None:
+                break
+
+            first_timestamp, first_frame = current
+            if first_timestamp < last_timestamp:
+                raise RuntimeError(
+                    f"Non-monotonic frame timestamps in {video_path}"
+                )
+            following = read_timed_frame(capture, video_path)
+            if following is None:
+                break
+            second_timestamp, second_frame = following
+            if second_timestamp < first_timestamp:
+                raise RuntimeError(
+                    f"Non-monotonic frame timestamps in {video_path}"
+                )
+            fractions.append(
+                changed_fraction(
+                    to_roi_gray(first_frame),
+                    to_roi_gray(second_frame),
+                    polygon_mask,
+                )
+            )
+            last_timestamp = second_timestamp
+            current = following
+            sample_time += 0.4
+    finally:
+        capture.release()
+    return fractions
+
+
+def noise_at_seconds(
+    samples: Sequence[float], seconds: float
+) -> bool:
+    """Apply the existing five-pair median noise test to sequential samples."""
+    first_index = max(0, math.ceil(seconds / 0.4 - 1e-9))
+    window = samples[first_index : first_index + 5]
+    return bool(window) and float(np.median(window)) >= NOISE_CHANGED_FRACTION
+
+
 def changed_fraction(
     previous_gray: np.ndarray, current_gray: np.ndarray, mask: np.ndarray
 ) -> float:
@@ -147,15 +270,126 @@ class MotionMetrics:
     largest_component: int
 
 
+@dataclass
+class DetectionSnapshot:
+    last_candidate_seconds: float
+    peak_seconds: float
+    frame: np.ndarray
+    previous_gray: np.ndarray
+    current_gray: np.ndarray
+    metrics: MotionMetrics
+
+
+def save_roi_visualization(
+    frame: np.ndarray,
+    polygon: Sequence[tuple[int, int]],
+    roi_mask: np.ndarray,
+    output_path: Path,
+) -> None:
+    """Save an overview marking the exact polygon included in motion analysis."""
+    polygon_array = np.asarray(polygon, dtype=np.int32)
+    full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(full_mask, [polygon_array], 255)
+    overlay = frame.copy()
+    overlay[full_mask > 0] = (255, 120, 0)
+    image = cv2.addWeighted(frame, 0.68, overlay, 0.32, 0)
+    cv2.polylines(image, [polygon_array], True, (0, 255, 255), 3, cv2.LINE_AA)
+    roi_pixels = cv2.countNonZero(roi_mask)
+    text = f"Measured ROI: {roi_pixels:,} pixels"
+    cv2.putText(
+        image, text, (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+        (0, 0, 0), 5, cv2.LINE_AA
+    )
+    cv2.putText(
+        image, text, (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+        (0, 255, 255), 2, cv2.LINE_AA
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), image, [cv2.IMWRITE_JPEG_QUALITY, 88]):
+        raise RuntimeError(f"Could not save ROI visualization: {output_path}")
+
+
+def save_detection_visualization(
+    frame: np.ndarray,
+    previous_gray: np.ndarray,
+    current_gray: np.ndarray,
+    polygon: Sequence[tuple[int, int]],
+    roi_mask: np.ndarray,
+    lag: int,
+    seconds: float,
+    metrics: MotionMetrics,
+    output_path: Path,
+) -> None:
+    """Save a frame with changed pixels and the largest component highlighted."""
+    polygon_array = np.asarray(polygon, dtype=np.int32)
+    x, y, width, height = cv2.boundingRect(polygon_array)
+    difference = cv2.absdiff(previous_gray, current_gray)
+    difference = cv2.bitwise_and(difference, difference, mask=roi_mask)
+    changed_mask = cv2.compare(difference, 20, cv2.CMP_GT)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        changed_mask, connectivity=8
+    )
+    largest_index = max(
+        range(1, count),
+        key=lambda index: int(stats[index, cv2.CC_STAT_AREA]),
+        default=None,
+    )
+
+    image = frame.copy()
+    full_changed_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    full_changed_mask[y : y + height, x : x + width] = changed_mask
+    image[full_changed_mask > 0] = (0, 0, 255)
+
+    if largest_index is not None:
+        largest_mask = np.zeros_like(changed_mask)
+        largest_mask[labels == largest_index] = 255
+        image[y : y + height, x : x + width][largest_mask > 0] = (
+            0, 255, 0
+        )
+        component_x = int(stats[largest_index, cv2.CC_STAT_LEFT]) + x
+        component_y = int(stats[largest_index, cv2.CC_STAT_TOP]) + y
+        component_width = int(stats[largest_index, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[largest_index, cv2.CC_STAT_HEIGHT])
+        cv2.rectangle(
+            image,
+            (component_x, component_y),
+            (
+                component_x + component_width - 1,
+                component_y + component_height - 1,
+            ),
+            (0, 255, 0),
+            3,
+        )
+
+    cv2.polylines(image, [polygon_array], True, (0, 255, 255), 3, cv2.LINE_AA)
+    text = (
+        f"lag {lag} | {seconds:.3f}s | "
+        f"{metrics.changed_pixels[1]} changed px (>20) | "
+        f"largest connected area {metrics.largest_component} px"
+    )
+    cv2.putText(
+        image, text, (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.85,
+        (0, 0, 0), 5, cv2.LINE_AA
+    )
+    cv2.putText(
+        image, text, (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.85,
+        (255, 255, 255), 2, cv2.LINE_AA
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), image, [cv2.IMWRITE_JPEG_QUALITY, 88]):
+        raise RuntimeError(
+            f"Could not save detection visualization: {output_path}"
+        )
+
+
 def group_motion_candidates(
-    candidates: Sequence[tuple[int, MotionMetrics]],
-    fps: float,
+    candidates: Sequence[tuple[float, MotionMetrics]],
     lag: int,
     min_component_px: int,
     merge_gap_seconds: float,
 ) -> list[dict[str, int | float]]:
     """Group large per-frame changes into reviewable candidate intervals."""
-    if fps <= 0 or lag < 1 or min_component_px < 1 or merge_gap_seconds < 0:
+    if lag < 1 or min_component_px < 1 or merge_gap_seconds < 0:
         raise ValueError("Invalid candidate grouping parameters")
 
     qualifying = [
@@ -163,12 +397,11 @@ def group_motion_candidates(
         for frame_index, metrics in candidates
         if metrics.largest_component >= min_component_px
     ]
-    max_gap_frames = int(round(merge_gap_seconds * fps))
-    groups: list[list[tuple[int, MotionMetrics]]] = []
+    groups: list[list[tuple[float, MotionMetrics]]] = []
     for candidate in qualifying:
         if (
             not groups
-            or candidate[0] - groups[-1][-1][0] > max_gap_frames + 1
+            or candidate[0] - groups[-1][-1][0] > merge_gap_seconds
         ):
             groups.append([])
         groups[-1].append(candidate)
@@ -181,10 +414,10 @@ def group_motion_candidates(
         intervals.append(
             {
                 "lag_frames": lag,
-                "start_seconds": group[0][0] / fps,
-                "end_seconds": group[-1][0] / fps,
+                "start_seconds": group[0][0],
+                "end_seconds": group[-1][0],
                 "sample_count": len(group),
-                "peak_seconds": peak_frame / fps,
+                "peak_seconds": peak_frame,
                 "peak_component_px": peak.largest_component,
                 "peak_changed_gt12_px": peak.changed_pixels[0],
                 "peak_changed_gt20_px": peak.changed_pixels[1],
@@ -193,6 +426,32 @@ def group_motion_candidates(
             }
         )
     return intervals
+
+
+def classify_candidate(
+    interval: dict[str, int | float],
+) -> tuple[str, str, float]:
+    """Classify an event by changed area and the share in its largest component."""
+    changed_pixels = int(interval["peak_changed_gt20_px"])
+    largest_component = int(interval["peak_component_px"])
+    coherent_fraction = largest_component / max(changed_pixels, 1)
+
+    if changed_pixels > MAX_CHANGED_PIXELS:
+        return "rejected", "changed pixels > 5000", coherent_fraction
+    if (
+        MIN_CHANGED_PIXELS_FOR_COHERENCE
+        <= changed_pixels
+        <= MAX_CHANGED_PIXELS
+        and coherent_fraction < MIN_COHERENT_FRACTION
+    ):
+        return (
+            "rejected",
+            "changed pixels 500-5000 and coherent area < 35%",
+            coherent_fraction,
+        )
+    if largest_component > MAX_COHERENT_COMPONENT_PIXELS:
+        return "rejected", "largest coherent area > 2000 px", coherent_fraction
+    return "interesting", "within acceptance thresholds", coherent_fraction
 
 
 def merge_candidate_intervals(
@@ -247,6 +506,28 @@ def save_candidate_clips(
     after_seconds: float = 5.0,
 ) -> list[Path]:
     """Save one source-video clip around each merged candidate peak."""
+    return [
+        path
+        for _, path in save_candidate_clips_for_events(
+            video_path,
+            output_dir,
+            intervals,
+            video_duration,
+            before_seconds,
+            after_seconds,
+        )
+    ]
+
+
+def save_candidate_clips_for_events(
+    video_path: Path,
+    output_dir: Path,
+    intervals: Sequence[dict[str, int | float]],
+    video_duration: float,
+    before_seconds: float = 1.0,
+    after_seconds: float = 5.0,
+) -> list[tuple[dict[str, int | float], Path]]:
+    """Save one clip per merged event and return (merged event, clip path)."""
     if before_seconds < 0 or after_seconds <= 0:
         raise ValueError("Clip timing must be non-negative with positive duration")
     if not intervals:
@@ -256,7 +537,7 @@ def save_candidate_clips(
         raise RuntimeError("ffmpeg is required to save candidate clips")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    saved_paths: list[Path] = []
+    saved_paths: list[tuple[dict[str, int | float], Path]] = []
     merged = merge_candidate_intervals(intervals, merge_gap_seconds=0.25)
     for index, event in enumerate(merged, start=1):
         peak_seconds = float(event["peak_seconds"])
@@ -272,6 +553,7 @@ def save_candidate_clips(
         )
         if clip_path.exists():
             print(f"Candidate clip already exists; keeping {clip_path}")
+            saved_paths.append((event, clip_path))
             continue
         suffix = 1
         while True:
@@ -329,7 +611,7 @@ def save_candidate_clips(
                 f"ffmpeg failed to save clip {clip_path}: {result.stderr.strip()}"
             )
         os.replace(temporary_path, clip_path)
-        saved_paths.append(clip_path)
+        saved_paths.append((event, clip_path))
         print(
             f"Saved candidate clip {clip_path} "
             f"({start_seconds:.2f}-{end_seconds:.2f}s)"
@@ -439,19 +721,13 @@ def analyze_video(
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    fps = capture.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        capture.release()
-        raise RuntimeError(f"Invalid frame rate in video: {video_path}")
-
     if len(polygon) < 3:
         capture.release()
         raise ValueError("Polygon must have at least three vertices")
-    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_duration = total_frames / fps if total_frames > 0 else 0.0
+    video_duration = video_duration_seconds(video_path)
     if video_duration <= 0:
         capture.release()
-        raise RuntimeError(f"Invalid frame count in video: {video_path}")
+        raise RuntimeError(f"Invalid video duration: {video_path}")
 
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -474,26 +750,6 @@ def analyze_video(
             frame[y : y + height, x : x + width], cv2.COLOR_BGR2GRAY
         )
 
-    def is_noisy(seconds: float) -> bool:
-        # Median over several adjacent-frame pairs so one bird cannot
-        # make a clean image look like snow.
-        fractions = []
-        for pair in range(5):
-            capture.set(
-                cv2.CAP_PROP_POS_FRAMES, int((seconds + pair * 0.4) * fps)
-            )
-            ok_a, frame_a = capture.read()
-            ok_b, frame_b = capture.read()
-            if ok_a and ok_b:
-                fractions.append(
-                    changed_fraction(
-                        to_roi_gray(frame_a), to_roi_gray(frame_b), polygon_mask
-                    )
-                )
-        return bool(fractions) and float(np.median(fractions)) >= (
-            NOISE_CHANGED_FRACTION
-        )
-
     analysis_ranges = [(0.0, video_duration)]
     if noise_filter:
         start_time = recording_start(video_path)
@@ -501,7 +757,13 @@ def analyze_video(
         if sun is None or overlaps_twilight_or_night(
             start_time, video_duration, *sun
         ):
-            analysis_ranges = find_clean_ranges(is_noisy, video_duration)
+            noise_samples = sample_noise_fractions(
+                video_path, video_duration, polygon_mask, to_roi_gray
+            )
+            analysis_ranges = find_clean_ranges(
+                lambda seconds: noise_at_seconds(noise_samples, seconds),
+                video_duration,
+            )
             clean_seconds = sum(end - begin for begin, end in analysis_ranges)
             print(
                 f"Noise scan {video_path.name}: "
@@ -509,14 +771,15 @@ def analyze_video(
                 + ", ".join(f"{b:.0f}-{e:.0f}s" for b, e in analysis_ranges),
                 flush=True,
             )
-    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
     history: deque[np.ndarray] = deque(maxlen=max(lags) + 1)
-    candidates_by_lag: dict[int, list[tuple[int, MotionMetrics]]] = {
+    candidates_by_lag: dict[int, list[tuple[float, MotionMetrics]]] = {
         lag: [] for lag in lags
     }
+    visualization_dir = output_path.parent / "visualizations"
+    visual_snapshots: dict[int, DetectionSnapshot] = {}
+    visual_counts = {lag: 0 for lag in lags}
+    visual_names: dict[int, list[str]] = {lag: [] for lag in lags}
     active_candidate: dict[str, int | float] | None = None
-    saved_clip_count = 0
     output_path.parent.mkdir(parents=True, exist_ok=True)
     headers = ["frame", "time_seconds"]
     for lag in lags:
@@ -531,47 +794,91 @@ def analyze_video(
         )
 
     def flush_active_candidate() -> None:
-        nonlocal active_candidate, saved_clip_count
-        if active_candidate is None:
-            return
-        clips = save_candidate_clips(
-            video_path,
-            clips_dir or default_clips_dir(video_path, output_path),
-            [active_candidate],
-            video_duration,
-            clip_before_seconds,
-            clip_after_seconds,
-        )
-        saved_clip_count += len(clips)
+        nonlocal active_candidate
         active_candidate = None
 
+    def flush_visual_snapshot(lag: int) -> None:
+        snapshot = visual_snapshots.pop(lag, None)
+        if snapshot is None:
+            return
+        visual_counts[lag] += 1
+        image_path = visualization_dir / (
+            f"{video_path.stem}_lag{lag}_candidate_{visual_counts[lag]:03d}_"
+            f"{elapsed_time_label(snapshot.peak_seconds)}.jpg"
+        )
+        visual_names[lag].append(image_path.name)
+        save_detection_visualization(
+            snapshot.frame,
+            snapshot.previous_gray,
+            snapshot.current_gray,
+            polygon,
+            polygon_mask,
+            lag,
+            snapshot.peak_seconds,
+            snapshot.metrics,
+            image_path,
+        )
+
     frame_index = 0
-    range_index = -1
-    range_end_frame = 0
+    range_index = 0
+    range_active = False
+    skip_until_seconds = 0.0
+    last_progress_minute = -1
+    last_timestamp = -1.0
     try:
         with output_path.open("w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(headers)
             while True:
-                if frame_index >= range_end_frame:
+                timed_frame = read_timed_frame(capture, video_path)
+                if timed_frame is None:
                     flush_active_candidate()
-                    range_index += 1
-                    if range_index >= len(analysis_ranges):
-                        break
-                    range_start, range_end = analysis_ranges[range_index]
-                    frame_index = int(range_start * fps)
-                    range_end_frame = int(range_end * fps)
-                    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                    break
+                frame_seconds, frame = timed_frame
+                if frame_seconds < last_timestamp:
+                    raise RuntimeError(
+                        f"Non-monotonic frame timestamps in {video_path}: "
+                        f"{frame_seconds:.3f} after {last_timestamp:.3f}"
+                    )
+                last_timestamp = frame_seconds
+                current_frame_index = frame_index
+                frame_index += 1
+                if current_frame_index == 0:
+                    save_roi_visualization(
+                        frame,
+                        polygon,
+                        polygon_mask,
+                        visualization_dir / f"{video_path.stem}_roi.jpg",
+                    )
+
+                while (
+                    range_index < len(analysis_ranges)
+                    and frame_seconds >= analysis_ranges[range_index][1]
+                ):
+                    if range_active:
+                        flush_active_candidate()
+                    range_active = False
                     history.clear()
-                    if frame_index >= range_end_frame:
-                        continue
-                ok, frame = capture.read()
-                if not ok:
-                    flush_active_candidate()
-                    range_end_frame = frame_index
+                    range_index += 1
+                if range_index >= len(analysis_ranges):
+                    break
+
+                range_start, range_end = analysis_ranges[range_index]
+                if frame_seconds < range_start or frame_seconds >= range_end:
+                    history.clear()
                     continue
+                if not range_active:
+                    range_active = True
+                    history.clear()
+                if frame_seconds < skip_until_seconds:
+                    history.clear()
+                    continue
+
                 gray = blur_gray(to_roi_gray(frame))
-                row: list[float | int] = [frame_index, frame_index / fps]
+                row: list[float | int] = [
+                    current_frame_index,
+                    round(frame_seconds, 3),
+                ]
                 frame_candidates: list[tuple[int, MotionMetrics]] = []
                 for lag in lags:
                     if len(history) >= lag:
@@ -583,9 +890,37 @@ def analyze_video(
                         )
                         if metrics.largest_component >= min_component_px:
                             candidates_by_lag[lag].append(
-                                (frame_index, metrics)
+                                (frame_seconds, metrics)
                             )
                             frame_candidates.append((lag, metrics))
+                            snapshot = visual_snapshots.get(lag)
+                            if (
+                                snapshot is not None
+                                and frame_seconds - snapshot.last_candidate_seconds
+                                > merge_gap_seconds
+                            ):
+                                flush_visual_snapshot(lag)
+                                snapshot = None
+                            if snapshot is None:
+                                visual_snapshots[lag] = DetectionSnapshot(
+                                    last_candidate_seconds=frame_seconds,
+                                    peak_seconds=frame_seconds,
+                                    frame=frame.copy(),
+                                    previous_gray=history[-lag].copy(),
+                                    current_gray=gray.copy(),
+                                    metrics=metrics,
+                                )
+                            else:
+                                snapshot.last_candidate_seconds = frame_seconds
+                                if (
+                                    metrics.largest_component
+                                    > snapshot.metrics.largest_component
+                                ):
+                                    snapshot.peak_seconds = frame_seconds
+                                    snapshot.frame = frame.copy()
+                                    snapshot.previous_gray = history[-lag].copy()
+                                    snapshot.current_gray = gray.copy()
+                                    snapshot.metrics = metrics
                         row.extend(
                             [
                                 round(metrics.mean_abs_difference, 3),
@@ -597,14 +932,13 @@ def analyze_video(
                         row.extend(["", "", "", "", ""])
                 writer.writerow(row)
                 history.append(gray)
-                frame_index += 1
 
                 if frame_candidates:
                     lag, peak = max(
                         frame_candidates,
                         key=lambda candidate: candidate[1].largest_component,
                     )
-                    candidate_time = (frame_index - 1) / fps
+                    candidate_time = frame_seconds
                     if active_candidate is None:
                         active_candidate = {
                             "lag_frames": lag,
@@ -617,13 +951,11 @@ def analyze_video(
                             "peak_changed_gt20_px": peak.changed_pixels[1],
                             "peak_changed_gt32_px": peak.changed_pixels[2],
                             "peak_mean_abs": peak.mean_abs_difference,
-                            "last_candidate_frame": frame_index - 1,
+                            "last_candidate_seconds": candidate_time,
                         }
                     else:
                         active_candidate["end_seconds"] = candidate_time
-                        active_candidate["last_candidate_frame"] = (
-                            frame_index - 1
-                        )
+                        active_candidate["last_candidate_seconds"] = candidate_time
                         active_candidate["sample_count"] = (
                             int(active_candidate["sample_count"]) + 1
                         )
@@ -642,33 +974,36 @@ def analyze_video(
                                 }
                             )
                 elif active_candidate is not None:
-                    quiet_frames = (
-                        frame_index - 1 - int(active_candidate["last_candidate_frame"])
+                    quiet_seconds = (
+                        frame_seconds
+                        - float(active_candidate["last_candidate_seconds"])
                     )
-                    if quiet_frames / fps > merge_gap_seconds:
-                        skip_to_frame = int(
-                            active_candidate["last_candidate_frame"]
-                            + skip_after_seconds * fps
+                    if quiet_seconds > merge_gap_seconds:
+                        skip_until_seconds = (
+                            float(active_candidate["last_candidate_seconds"])
+                            + skip_after_seconds
                         )
                         flush_active_candidate()
-                        # The clip already covers the following seconds, so
-                        # resume analysis only after the skip window.
-                        if skip_to_frame > frame_index:
-                            frame_index = min(skip_to_frame, range_end_frame)
-                            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                            history.clear()
+                        history.clear()
 
-                if frame_index % int(fps * 60) == 0:
-                    print(f"Analyzed {frame_index / fps:.0f} seconds")
+                progress_minute = int(frame_seconds // 60)
+                if progress_minute > last_progress_minute:
+                    print(f"Analyzed {frame_seconds:.0f} seconds", flush=True)
+                    last_progress_minute = progress_minute
     finally:
         capture.release()
 
     flush_active_candidate()
+    for lag in lags:
+        flush_visual_snapshot(lag)
 
     events_path = output_path.with_name(
         f"{output_path.stem}_events{output_path.suffix}"
     )
     event_headers = [
+        "recording",
+        "clip_file",
+        "visualization_file",
         "lag_frames",
         "start_seconds",
         "end_seconds",
@@ -679,33 +1014,90 @@ def analyze_video(
         "peak_changed_gt20_px",
         "peak_changed_gt32_px",
         "peak_mean_abs",
+        "coherent_area_percent",
+        "decision",
+        "decision_reason",
     ]
+    decided_events: list[
+        tuple[dict[str, int | float], str, str, float, str]
+    ] = []
+    accepted_intervals: list[dict[str, int | float]] = []
+    for lag in lags:
+        intervals = group_motion_candidates(
+            candidates_by_lag[lag],
+            lag,
+            min_component_px,
+            merge_gap_seconds,
+        )
+        if len(intervals) != len(visual_names[lag]):
+            raise RuntimeError(
+                f"Lag {lag}: {len(intervals)} events but "
+                f"{len(visual_names[lag])} detection images"
+            )
+        for interval, image_name in zip(intervals, visual_names[lag]):
+            decision, reason, coherent_fraction = classify_candidate(interval)
+            decided_events.append(
+                (interval, decision, reason, coherent_fraction, image_name)
+            )
+            if decision == "interesting":
+                accepted_intervals.append(interval)
+
+    decided_events.sort(
+        key=lambda item: (float(item[0]["peak_seconds"]), int(item[0]["lag_frames"]))
+    )
+    clips_output_dir = clips_dir or default_clips_dir(video_path, output_path)
+    saved_clips = save_candidate_clips_for_events(
+        video_path,
+        clips_output_dir,
+        accepted_intervals,
+        video_duration,
+        clip_before_seconds,
+        clip_after_seconds,
+    )
+
+    def clip_name_for(interval: dict[str, int | float]) -> str:
+        for merged_event, clip_path in saved_clips:
+            if float(merged_event["start_seconds"]) <= float(
+                interval["start_seconds"]
+            ) and float(interval["end_seconds"]) <= float(
+                merged_event["end_seconds"]
+            ):
+                return clip_path.name
+        return ""
+
     with events_path.open("w", newline="", encoding="utf-8") as events_file:
         writer = csv.DictWriter(events_file, fieldnames=event_headers)
         writer.writeheader()
-        all_intervals: list[dict[str, int | float]] = []
-        for lag in lags:
-            intervals = group_motion_candidates(
-                candidates_by_lag[lag],
-                fps,
-                lag,
-                min_component_px,
-                merge_gap_seconds,
+        for interval, decision, reason, coherent_fraction, image_name in (
+            decided_events
+        ):
+            clip_name = (
+                clip_name_for(interval) if decision == "interesting" else ""
             )
-            for interval in intervals:
-                all_intervals.append(interval)
-                writer.writerow(interval)
-                print(
-                    f"Candidate lag={lag} frames "
-                    f"{interval['start_seconds']:.2f}-"
-                    f"{interval['end_seconds']:.2f}s; peak "
-                    f"{interval['peak_component_px']} px component at "
-                    f"{interval['peak_seconds']:.2f}s"
-                )
+            writer.writerow(
+                {
+                    "recording": video_path.name,
+                    "clip_file": clip_name,
+                    "visualization_file": image_name,
+                    **interval,
+                    "coherent_area_percent": round(coherent_fraction * 100, 2),
+                    "decision": decision,
+                    "decision_reason": reason,
+                }
+            )
+            print(
+                f"Candidate lag={interval['lag_frames']} "
+                f"{interval['start_seconds']:.2f}-"
+                f"{interval['end_seconds']:.2f}s; peak "
+                f"{interval['peak_changed_gt20_px']} changed pixels, "
+                f"{interval['peak_component_px']} px component "
+                f"({coherent_fraction:.1%}); {decision}: {reason}"
+                + (f" -> {clip_name}" if clip_name else "")
+            )
 
+    saved_clip_count = len(saved_clips)
     print(f"Candidate intervals: {events_path}")
-    clips_dir = clips_dir or default_clips_dir(video_path, output_path)
-    print(f"Saved {saved_clip_count} candidate clips to {clips_dir}")
+    print(f"Saved {saved_clip_count} candidate clips to {clips_output_dir}")
     return frame_index
 
 
@@ -722,7 +1114,7 @@ def run_watch(
     skip_after: float,
     days_back: int = 1,
 ) -> None:
-    """Analyze each finished recording once, tracked in sikorki/analyzed.txt."""
+    """Analyze each finished recording once, tracked in POE1_sikorki/analyzed.txt."""
     from mcrwac.analysis import squirrel_exit_prototype as watcher
 
     def analyze(video: Path) -> None:
@@ -746,6 +1138,11 @@ def run_watch(
 
     signal.signal(signal.SIGTERM, terminate)
     print(f"Watching {camera_dir}", flush=True)
+    from mcrwac.notify import build_service_notifier
+
+    notifier = build_service_notifier("POE1 sikorki")
+    notifier.event("start analizy", title="Start", tags="red_circle")
+    stop_reason = "zatrzymanie uslugi"
     try:
         watcher.watch_recordings(
             camera_dir,
@@ -757,6 +1154,18 @@ def run_watch(
         )
     except KeyboardInterrupt:
         print("Interrupted", flush=True)
+    except SystemExit:
+        raise
+    except BaseException as error:
+        stop_reason = f"blad: {type(error).__name__}: {error}"
+        raise
+    finally:
+        notifier.event(
+            f"stop analizy ({stop_reason})",
+            title="Stop",
+            tags="black_square_for_stop",
+        )
+        notifier.close()
 
 
 def main() -> None:

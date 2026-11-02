@@ -1,3 +1,4 @@
+import csv
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ from mcrwac.analysis.poe1_bird_motion import (
     DEFAULT_CLIP_BEFORE_SECONDS,
     DEFAULT_SKIP_AFTER_SECONDS,
     analyze_video,
+    classify_candidate,
     default_clips_dir,
     elapsed_time_label,
     find_clean_ranges,
@@ -74,8 +76,7 @@ class Poe1BirdMotionTests(unittest.TestCase):
         small = MotionMetrics(1.0, (20, 10, 2), 50)
         candidate = MotionMetrics(2.0, (300, 240, 150), 220)
         intervals = group_motion_candidates(
-            [(10, small), (20, candidate), (25, candidate), (40, candidate)],
-            fps=25,
+            [(0.4, small), (0.8, candidate), (1.0, candidate), (1.6, candidate)],
             lag=3,
             min_component_px=100,
             merge_gap_seconds=0.25,
@@ -91,11 +92,50 @@ class Poe1BirdMotionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             group_motion_candidates(
                 [],
-                fps=0,
                 lag=1,
                 min_component_px=1,
-                merge_gap_seconds=0.25,
+                merge_gap_seconds=-0.25,
             )
+
+    def test_candidate_grouping_uses_elapsed_time_not_nominal_frame_rate(self) -> None:
+        candidate = MotionMetrics(2.0, (300, 240, 150), 220)
+        intervals = group_motion_candidates(
+            [(10.0, candidate), (10.08, candidate), (10.40, candidate)],
+            lag=3,
+            min_component_px=100,
+            merge_gap_seconds=0.25,
+        )
+
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual(intervals[0]["end_seconds"], 10.08)
+        self.assertEqual(intervals[1]["start_seconds"], 10.40)
+
+    def test_candidate_classification_rejects_large_flicker_area(self) -> None:
+        decision, reason, coherent_fraction = classify_candidate(
+            {"peak_changed_gt20_px": 2514, "peak_component_px": 211}
+        )
+
+        self.assertEqual(decision, "rejected")
+        self.assertIn("coherent area < 35%", reason)
+        self.assertAlmostEqual(coherent_fraction, 211 / 2514)
+
+    def test_candidate_classification_accepts_compact_bird_motion(self) -> None:
+        decision, reason, coherent_fraction = classify_candidate(
+            {"peak_changed_gt20_px": 671, "peak_component_px": 286}
+        )
+
+        self.assertEqual(decision, "interesting")
+        self.assertEqual(reason, "within acceptance thresholds")
+        self.assertAlmostEqual(coherent_fraction, 286 / 671)
+
+    def test_candidate_classification_rejects_camera_perch_by_area_rule(self) -> None:
+        decision, reason, coherent_fraction = classify_candidate(
+            {"peak_changed_gt20_px": 30103, "peak_component_px": 25449}
+        )
+
+        self.assertEqual(decision, "rejected")
+        self.assertEqual(reason, "changed pixels > 5000")
+        self.assertGreater(coherent_fraction, 0.8)
 
     def test_merges_overlapping_lag_results_but_keeps_separate_events(self) -> None:
         intervals = [
@@ -191,7 +231,7 @@ class Poe1BirdMotionTests(unittest.TestCase):
             default_clips_dir(
                 Path("/rec/POE1/2026-10-28/05-24-15.mkv"), Path("/tmp/x.csv")
             ),
-            Path("/opt/cameras/recordings/analysis/2026-10-28/sikorki"),
+            Path("/opt/cameras/recordings/analysis/2026-10-28/POE1_sikorki"),
         )
 
     def test_events_inside_skip_window_make_one_clip(self) -> None:
@@ -208,7 +248,7 @@ class Poe1BirdMotionTests(unittest.TestCase):
             for index in range(fps * seconds):
                 frame = np.full((100, 160, 3), 60, dtype=np.uint8)
                 if index // fps in (10, 12, 40):
-                    frame[30:70, 30:90] = 220
+                    frame[40:60, 40:60] = 220
                 writer.write(frame)
             writer.release()
             video.write_bytes(avi.read_bytes())
@@ -226,6 +266,49 @@ class Poe1BirdMotionTests(unittest.TestCase):
 
             names = sorted(path.name for path in clips.glob("*_candidate_*"))
             self.assertEqual(len(names), 2, names)
+            with (clips / "motion_events.csv").open(newline="") as events_file:
+                decisions = list(csv.DictReader(events_file))
+            self.assertTrue(decisions)
+            self.assertTrue(
+                all(event["decision"] == "interesting" for event in decisions)
+            )
+            self.assertIn("decision_reason", decisions[0])
+            peaks = [float(event["peak_seconds"]) for event in decisions]
+            self.assertEqual(peaks, sorted(peaks))
+            self.assertEqual(
+                {event["clip_file"] for event in decisions}, set(names)
+            )
+            for event in decisions:
+                self.assertTrue(
+                    (clips / "visualizations" / event["visualization_file"]).exists()
+                )
+
+            first_clip = cv2.VideoCapture(str(clips / names[0]))
+            event_visible_at_peak = False
+            while True:
+                ok, frame = first_clip.read()
+                if not ok:
+                    break
+                clip_seconds = (
+                    first_clip.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                )
+                if 0.9 <= clip_seconds <= 1.5 and frame[50, 50, 0] > 150:
+                    event_visible_at_peak = True
+                    break
+            first_clip.release()
+            self.assertTrue(
+                event_visible_at_peak,
+                "The clip around the CSV peak must contain the changed object",
+            )
+
+            visualizations = clips / "visualizations"
+            self.assertTrue((visualizations / "05-00-00_roi.jpg").is_file())
+            detection_images = list(
+                visualizations.glob("05-00-00_lag*_candidate_*.jpg")
+            )
+            self.assertTrue(detection_images)
+            image = cv2.imread(str(detection_images[0]))
+            self.assertIsNotNone(image)
 
     def test_default_clip_is_three_seconds_with_3s_skip(self) -> None:
         self.assertEqual(DEFAULT_SKIP_AFTER_SECONDS, 3.0)

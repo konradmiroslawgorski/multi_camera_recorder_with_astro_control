@@ -41,6 +41,15 @@ Offline'owa analiza nagrań `POE_BRAMA` (usługa `squirrel-analysis`). Opis algo
 uruchamiania i plików wynikowych: [README_SQUIRREL_ANALYSIS.md](README_SQUIRREL_ANALYSIS.md),
 część techniczna: [README_SQUIRREL_ANALYSIS_TECH.md](README_SQUIRREL_ANALYSIS_TECH.md).
 
+## Czas na nagraniach POE_BRAMA
+
+Kamera `POE_BRAMA` daje dwa obrazy w jednej klatce, a rejestrator zapisuje tylko
+dolną połowę (`PRE_CROP=lower_half`), więc oryginalny zegar znika. Przy tym samym
+przekodowaniu ffmpeg wypala czas serwera (`RRRR-MM-DD GG:MM:SS`) w lewym dolnym
+rogu, zamiast napisu CAMO1 (`TIMESTAMP_FILTER` w `mcrwac/core/recorder.py`).
+Dotyczy tylko nowych nagrań; kamery bez przycięcia (POE1) są kopiowane bez zmian.
+Klipy z analizy wiewiórek wycinają ten obraz, więc też mają czas.
+
 ## Powiadomienia push (ntfy)
 
 Rejestrator wysyła powiadomienia przez [ntfy](https://ntfy.sh) (push na iPhone
@@ -65,6 +74,11 @@ działa jak hasło (publiczny serwer), więc nie trzymamy jej w repozytorium:
 
 Bez `NTFY_TOPIC` powiadomienia są wyłączone (ostrzeżenie w logu), a nagrywanie działa normalnie.
 Awaria sieci nigdy nie blokuje nagrywania.
+
+Usługi analizy (`poe1-sikorki-analysis` jako `POE1 sikorki`, `squirrel-analysis`
+jako `POE_BRAMA_wiewiorki`) używają tego samego tematu i wysyłają tylko dwa
+powiadomienia: **start** i **stop** usługi (z powodem: zatrzymanie usługi albo
+błąd). Wyniki dnia składają się na bieżąco w `result_RRRR_MM_DD.mkv`.
 
 ## Dostęp do nagrań (sieć lokalna)
 

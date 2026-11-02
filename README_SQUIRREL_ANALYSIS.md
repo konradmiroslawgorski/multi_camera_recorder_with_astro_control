@@ -68,6 +68,13 @@ pliku prototypu.
    pierwsza z tych klatek. Kolejne zdarzenie jest możliwe dopiero po ≥ 1,5 s
    bez dużego regionu. Skutek rzadszej analizy: bardzo krótkie przeloty
    (poniżej ok. 0,7 s) mogą zostać pominięte.
+8a. **Pomiar wielkości dziury (wolna wiewiórka).** Co 10 s program liczy ciemne
+    piksele w małym oknie wokół otworu (±22 × ±30 px) względem mediany ostatnich
+    próbek (ok. 5 min). Gdy jest ich ≥ 150 i ≥ 2,5× więcej niż zwykle, zgłasza
+    zdarzenie, nawet gdy wiewiórka rusza się zbyt wolno albo jest zbyt mała dla
+    kroku 7. Nie dubluje zdarzeń w obrębie długości klipu.
+    Wyszukiwanie komina i szczytu dachu najpierw sprawdza okolice wzorcowych
+    położeń (±120 px, próg 0,50), co ratuje świt, gdy dopasowanie jest słabe.
 9. **Tryby.** `first` (domyślny) kończy analizę po pierwszym zdarzeniu; `all`
    analizuje cały film i zapisuje każde pojawienie się.
 10. **Wyniki.** Dla każdego zdarzenia ffmpeg wycina klip od początku zdarzenia
@@ -132,7 +139,7 @@ analiza przechodzi przez północ. `--hours` ogranicza zakres godzin każdego dn
 Proces ma obniżony priorytet (`--nice`, domyślnie 10), by nie dławić
 rejestratora.
 
-Lista przeanalizowanych plików to `analysis/RRRR-MM-DD/wiewiorki/analyzed.txt` (nazwa i
+Lista przeanalizowanych plików to `analysis/RRRR-MM-DD/POE_BRAMA_wiewiorki/analyzed.txt` (nazwa i
 `ok` albo `blad`); wpisuje ją też zwykłe uruchomienie `--date`/plik bez
 `--output`. Wpis chroni przed ponowną analizą — aby powtórzyć plik, usuń jego
 wiersz. Plik z błędem trafia do listy jako `blad` i nie jest ponawiany.
@@ -161,7 +168,7 @@ jeden klip na plik.
 ### Pliki wynikowe
 
 Wszystko trafia domyślnie do podkatalogu z datą nagrania,
-`/opt/cameras/recordings/analysis/RRRR-MM-DD/wiewiorki/` (np. `analysis/2026-10-26/`;
+`/opt/cameras/recordings/analysis/RRRR-MM-DD/POE_BRAMA_wiewiorki/` (np. `analysis/2026-10-26/`;
 tworzony automatycznie), a nazwy mają postać
 `<nazwa nagrania>_<...>_RRRRMMDDGGMMSS`:
 
@@ -180,3 +187,59 @@ nadpisują wyników — dostają sufiks, np. `_02`. Opcja `--output` wskazuje in
 bazową ścieżkę (klipy i CSV trafiają wtedy obok niej, z dopisanym czasem).
 Podgląd pomija okresy, gdy otworu szukano, więc bywa krótszy od
 nagrania; CSV zawsze ma czas źródłowy.
+
+W trybie `--watch` (usługa) po każdym przeanalizowanym nagraniu program skleja klipy dnia
+(`*.mkv` w kolejności czasu) w `result_RRRR_MM_DD.mkv` w tym samym katalogu
+(np. `result_2026_10_31.mkv`). Plik jest odświeżany, gdy pojawią się nowsze
+klipy. Tak samo dla sikorek (`.../POE1_sikorki/`).
+
+### Obsługa usługi i logów
+
+Jednostkę instaluje się jednorazowo z katalogu głównego repozytorium. Polecenie
+włącza usługę teraz i przy każdym starcie systemu:
+
+```bash
+sudo cp systemd/squirrel-analysis.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now squirrel-analysis.service
+```
+
+Sprawdzenie statusu i tego, czy usługa działa:
+
+```bash
+sudo systemctl status squirrel-analysis.service --no-pager
+systemctl is-active squirrel-analysis.service
+```
+
+Logi usługi z dzisiejszego dnia (według lokalnego czasu systemu):
+
+```bash
+sudo journalctl -u squirrel-analysis.service --since today --no-pager
+```
+
+Podgląd nowych wpisów na żywo oraz ostatnie 100 wpisów:
+
+```bash
+sudo journalctl -u squirrel-analysis.service -f
+sudo journalctl -u squirrel-analysis.service -n 100 --no-pager
+```
+
+Po zmianie pliku jednostki wykonaj `sudo systemctl daemon-reload`, a następnie
+zrestartuj usługę. Ręczne polecenia sterujące:
+
+```bash
+sudo systemctl restart squirrel-analysis.service
+sudo systemctl stop squirrel-analysis.service
+sudo systemctl start squirrel-analysis.service
+```
+
+Dzisiejsze wyniki i lista obsłużonych nagrań są w katalogu:
+
+```bash
+today=$(date +%F)
+ls -lah "/opt/cameras/recordings/analysis/$today/POE_BRAMA_wiewiorki/"
+tail -n 30 "/opt/cameras/recordings/analysis/$today/POE_BRAMA_wiewiorki/analyzed.txt"
+```
+
+`journalctl` pokazuje log działania procesu; `analyzed.txt` jest osobną listą
+przetworzonych nagrań, a nie logiem systemd.

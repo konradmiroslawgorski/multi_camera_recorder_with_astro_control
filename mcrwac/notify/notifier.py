@@ -206,3 +206,23 @@ def build_notifier(
         float(ntfy.get("timeout_seconds", 10)),
     )
     return Notifier(transport, camera, timezone, group_seconds)
+
+
+def build_service_notifier(label: str, config_path: Optional[Path] = None) -> Notifier:
+    """Notifier dla usługi analizy (start/stop); nigdy nie rzuca wyjątków."""
+    import yaml
+
+    path = config_path or Path(
+        os.environ.get(
+            "RECORDING_CONFIG",
+            str(Path(__file__).resolve().parents[2] / "config" / "recording_config.yaml"),
+        )
+    )
+    try:
+        with open(path, "r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+        timezone = (config.get("location") or {}).get("timezone", "UTC")
+        return build_notifier(config, label, timezone, path.parent)
+    except Exception as error:  # powiadomienia nie mogą zatrzymać analizy
+        logger.warning("Powiadomienia wylaczone: %s", error)
+        return Notifier(None, label)

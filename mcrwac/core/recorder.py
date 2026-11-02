@@ -32,6 +32,18 @@ def _next_start(now: datetime, window: RecordingWindow) -> datetime:
     return window.get_window(next_day)[2]
 
 
+# Kamera z dwoma obrazami w jednej klatce: po przycięciu do dolnej połowy znika jej
+# zegar, więc czas serwera jest wypalany w lewym dolnym rogu (zamiast napisu CAMO1).
+TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+TIMESTAMP_FILTER = (
+    "drawbox=x=0:y=ih-70:w=435:h=70:color=black@1:t=fill,"
+    f"drawtext=fontfile={TIMESTAMP_FONT}:"
+    r"text='%{localtime\:%Y-%m-%d %H\\\:%M\\\:%S}':"
+    "x=12:y=h-52:fontsize=36:fontcolor=white"
+)
+LOWER_HALF_FILTER = f"crop=iw:ih/2:0:ih/2,{TIMESTAMP_FILTER}"
+
+
 def _ffmpeg_command(
     rtsp_url: str, segment_time: str, output_template: str, pre_crop: str
 ) -> list[str]:
@@ -54,7 +66,7 @@ def _ffmpeg_command(
         command.extend(
             [
                 "-vf",
-                "crop=iw:ih/2:0:ih/2",
+                LOWER_HALF_FILTER,
                 "-c:v",
                 "libx264",
                 "-preset",

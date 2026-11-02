@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 import unittest
 from datetime import date, datetime, time
 from pathlib import Path
@@ -28,7 +30,10 @@ from mcrwac.analysis.squirrel_exit_prototype import (
     _save_appearance_clips,
     _timestamped_output_path,
     _update_background,
+    OpeningSizeDetector,
     activity_regions,
+    build_day_result,
+    update_day_results,
     locate_opening_by_triangle,
     next_pending_recording,
     select_recordings,
@@ -318,12 +323,12 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         video = Path("/rec/POE1/2026-10-28/05-24-15.mkv")
 
         self.assertEqual(
-            _analyzed_list_path(video, Path("/a"), "sikorki"),
-            Path("/a/2026-10-28/sikorki/analyzed.txt"),
+            _analyzed_list_path(video, Path("/a"), "POE1_sikorki"),
+            Path("/a/2026-10-28/POE1_sikorki/analyzed.txt"),
         )
         self.assertEqual(
             _analyzed_list_path(video, Path("/a")),
-            Path("/a/2026-10-28/wiewiorki/analyzed.txt"),
+            Path("/a/2026-10-28/POE_BRAMA_wiewiorki/analyzed.txt"),
         )
 
     def test_default_output_path_is_analysis_directory(self) -> None:
@@ -335,7 +340,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
 
         self.assertEqual(
             output_path,
-            Path("/opt/cameras/recordings/analysis/2026-10-25/wiewiorki/05-49-02_analysis_20261025054902.mp4"),
+            Path("/opt/cameras/recordings/analysis/2026-10-25/POE_BRAMA_wiewiorki/05-49-02_analysis_20261025054902.mp4"),
         )
 
     def _make_day(self, root: Path, names_ages: dict[str, float], now: float) -> Path:
@@ -385,7 +390,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             self.assertEqual(first.name, "13-00-00.mkv")
 
             _mark_analyzed(first, "ok", analysis)
-            self.assertEqual(_load_analyzed(analysis / "2026-10-27" / "wiewiorki" / "analyzed.txt"),
+            self.assertEqual(_load_analyzed(analysis / "2026-10-27" / "POE_BRAMA_wiewiorki" / "analyzed.txt"),
                              {"13-00-00.mkv"})
             self.assertIsNone(
                 next_pending_recording(camera_dir, day, day, now, analysis_dir=analysis)
@@ -395,6 +400,56 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                 camera_dir, day, day, now + 200, analysis_dir=analysis
             )
             self.assertEqual(last.name, "13-30-00.mkv")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+    def test_day_result_is_built_as_soon_as_clips_exist(self) -> None:
+        now = 1_800_000_000.0
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            camera_dir = self._make_day(
+                root, {"13-00-00.mkv": 1800, "13-30-00.mkv": 1800}, now
+            )
+            analysis = root / "analysis"
+            day_dir = analysis / "2026-10-27" / "POE_BRAMA_wiewiorki"
+            day_dir.mkdir(parents=True)
+            for name in ("13-00-00_a.mkv", "13-30-00_b.mkv"):
+                subprocess.run(
+                    ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                     "testsrc=size=64x48:rate=10:duration=1", "-c:v", "libx264",
+                     str(day_dir / name)],
+                    check=True,
+                )
+            day = date(2026, 10, 27)
+            failed: set = set()
+            update_day_results(camera_dir, day, day, analysis, "POE_BRAMA_wiewiorki", failed)
+            result = day_dir / "result_2026_10_27.mkv"
+            self.assertTrue(result.exists())
+            duration = float(subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(result)],
+                capture_output=True, text=True, check=True,
+            ).stdout)
+            self.assertGreater(duration, 1.8)
+
+    def test_size_detector_flags_slowly_enlarged_opening_once(self) -> None:
+        rng = np.random.default_rng(0)
+        detector = OpeningSizeDetector(fps=10.0)
+        wall = np.full((300, 300, 3), 170, dtype=np.uint8)
+
+        def frame(squirrel: bool) -> np.ndarray:
+            image = wall.copy()
+            image += rng.integers(0, 3, image.shape, dtype=np.uint8)
+            if squirrel:
+                cv2.rectangle(image, (140, 140), (160, 168), (20, 20, 20), -1)
+            return image
+
+        results = []
+        for second in range(0, 200, 10):
+            results.append(
+                detector.update(second * 10, frame(100 <= second < 150), 150, 150)
+            )
+        starts = [item.start_frame for item in results if item is not None]
+        self.assertEqual(starts, [1000])
 
     def test_next_pending_respects_hours_range(self) -> None:
         now = 1_800_000_000.0
@@ -440,7 +495,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                     clock=lambda: now, sleep=stop,
                 )
 
-            lines = (analysis / "2026-10-27" / "wiewiorki" / "analyzed.txt").read_text().splitlines()
+            lines = (analysis / "2026-10-27" / "POE_BRAMA_wiewiorki" / "analyzed.txt").read_text().splitlines()
 
         self.assertEqual(analyzed, ["10-00-00.mkv", "10-30-00.mkv", "11-00-00.mkv"])
         self.assertEqual(
