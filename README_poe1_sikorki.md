@@ -52,6 +52,14 @@ Kamera może się przesunąć, mogę zadbać by była mniej więcej po środku k
      pikseli. `--lags 1 3` (domyślnie; np. `--lags 1 3 5` daje czulszy, wolniejszy wariant); czasy są sekundami od początku
      nagrania. Współrzędne wielokąta można podać jawnie przez
      `--polygon x1 y1 x2 y2 x3 y3 ...`; domyślnie używany jest obrys powyżej.
+     Domyślny obszar to ciemne podbicie dachu (współrzędne
+     `(1088,605) (1318,564) (1462,1133) (1258,1187)` dla kadru 2560×1440),
+     ustawione względem prawego dolnego rogu dachu. Kamera przesuwa się w ciągu
+     dnia o kilka pikseli, więc każdą klatkę dopasowuje się wzorzec rogu
+     (`mcrwac/analysis/reference/poe1_roof_corner.png`, krawędzie, okno ±8 px;
+     co 5 s i po utracie okno ±60 px) i przesuwa wielokąt o różnicę ≥2 px
+     (wtedy historia klatek jest czyszczona). Przy dopasowaniu słabszym niż 0,35
+     (noc, mgła) zostaje ostatnie położenie. W logu: `Roof corner ... shift`.
      W podkatalogu `visualizations/` zapisywany jest też obraz ROI
      (`<nagranie>_roi.jpg`) oraz obraz szczytowej klatki każdego przedziału
      (`<nagranie>_lagN_candidate_...jpg`). W tych drugich czerwone piksele

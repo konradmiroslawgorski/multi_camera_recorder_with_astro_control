@@ -78,7 +78,7 @@ BACKGROUND_FREEZE_SECONDS = 30.0
 ROI_HALF_WIDTH = 16
 ROI_TOP = 24
 ROI_BOTTOM = 24
-DEFAULT_MIN_DIAGONAL_PX = 18.0
+DEFAULT_MIN_DIAGONAL_PX = 14.0
 MIN_REGION_SIDE_PX = 5
 MAX_REGION_ASPECT = 6.0
 DEFAULT_ANALYSIS_OUTPUT_DIR = Path("/opt/cameras/recordings/analysis")
@@ -511,9 +511,9 @@ def activity_regions(
 class AppearanceDetector:
     def __init__(self, fps: float, frame_step: int = 1):
         # Przy rzadszej analizie okno liczone w próbkach jest krótsze (3 z 5
-        # klatek co 1 klatkę odpowiada ok. 2 z 3 próbek co 4. klatkę).
+        # klatek co 1 klatkę odpowiada ok. 2 z 4 próbek).
         sparse = frame_step > 1
-        self._window = 3 if sparse else CONFIRM_WINDOW_FRAMES
+        self._window = 4 if sparse else CONFIRM_WINDOW_FRAMES
         self._hits = 2 if sparse else CONFIRM_HITS
         self._history: deque[tuple[int, bool]] = deque(maxlen=self._window)
         self._release_gap_frames = max(1, int(round(fps * RELEASE_GAP_SECONDS)))
@@ -884,14 +884,12 @@ def analyze_video(
                 )
                 previous_window = current_window
                 interval_jump = False
-                if camera_jump and tracked.confidence >= MIN_TRACK_CONFIDENCE:
-                    # Po odświeżeniu obrazu przez kamerę próbka jest pomijana,
-                    # a tło okna zaczyna się od nowego obrazu.
+                skip_sample = camera_jump and tracked.confidence >= MIN_TRACK_CONFIDENCE
+                if skip_sample:
+                    # Próbka z odświeżenia obrazu przez kamerę jest pomijana (nie
+                    # trafia do okna potwierdzania ani do tła); tło sprzed skoku
+                    # zostaje, a różnicę jasności wyrównuje _activity_mask.
                     mask, bounds, changed_ratio = None, None, 0.0
-                    background = _reference_window(
-                        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
-                        OpeningCandidate(tracked.x, tracked.y, 1.0),
-                    )
                 else:
                     mask, bounds, changed_ratio = _activity_mask(
                         frame, reference_gray, opening, tracked, background
@@ -902,7 +900,9 @@ def analyze_video(
                     regions, largest_diagonal = activity_regions(mask, min_diagonal_px)
                     if background is not None and bounds is not None:
                         _update_background(background, frame, bounds, mask, analyzed_fps)
-                appearance = detector.update(frame_index, bool(regions))
+                appearance = (
+                    None if skip_sample else detector.update(frame_index, bool(regions))
+                )
                 if SIZE_DETECTOR_ENABLED and mask is not None:
                     size_appearance = size_detector.update(
                         frame_index, frame, tracked.x, tracked.y

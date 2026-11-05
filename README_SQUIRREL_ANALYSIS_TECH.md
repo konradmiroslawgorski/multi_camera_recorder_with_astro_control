@@ -47,9 +47,9 @@ Przepływ `analyze_video`: odczyt metadanych → `_find_opening` → pętla klat
 - **ROI**: ±16 px poziomo, 24 px w górę, 24 px w dół (32×48 px) od otworu.
 - **Tło adaptacyjne**: start z wzorca; `accumulateWeighted` α = 0,01; piksele zmienione są zamrożone do 30 s, dłuższa zmiana (światło) wchodzi do tła.
 - **Maska**: od różnicy odjęta mediana (globalna ekspozycja); piksel aktywny, gdy `tło − obraz > 25` **i** `obraz < tło × 0,65`; rozmycie 3×3, otwarcie morfologiczne 3×3.
-- **Regiony**: przekątna > 18 px, krótszy bok ≥ 5 px, proporcje ≤ 6.
+- **Regiony**: przekątna > 14 px, krótszy bok ≥ 5 px, proporcje ≤ 6.
 - **Decyzja**: przy `--frame-step 1` okno 5 klatek / 3 trafienia; przy kroku > 1 okno 3 / 2 trafienia; zwolnienie po przerwie 1,5 s.
-- Domyślnie `--frame-step 12` (≈ 1 próbka na sekundę, okno 3 próbek / 2 trafienia): wiewiórka na ścianie porusza się bardzo wolno, a krótkie przeloty (wrony) nie są celem.
+- Domyślnie `--frame-step 12` (≈ 1 próbka na sekundę, okno 4 próbek / 2 trafienia): wiewiórka na ścianie porusza się bardzo wolno, a krótkie przeloty (wrony) nie są celem.
 
 ## 5. Uzasadnienia i historia strojenia
 

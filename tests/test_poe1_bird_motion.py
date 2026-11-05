@@ -9,6 +9,10 @@ import numpy as np
 
 from mcrwac.analysis.poe1_bird_motion import (
     MotionMetrics,
+    ROOF_CORNER_REFERENCE,
+    ROOF_TEMPLATE_BEFORE,
+    ROOF_TEMPLATE_FILE,
+    RoofCornerTracker,
     DEFAULT_CLIP_AFTER_SECONDS,
     DEFAULT_CLIP_BEFORE_SECONDS,
     DEFAULT_SKIP_AFTER_SECONDS,
@@ -315,6 +319,26 @@ class Poe1BirdMotionTests(unittest.TestCase):
         self.assertEqual(
             DEFAULT_CLIP_BEFORE_SECONDS + DEFAULT_CLIP_AFTER_SECONDS, 3.0
         )
+
+
+class RoofCornerTrackerTests(unittest.TestCase):
+    def frame_with_corner(self, shift: tuple[int, int]) -> np.ndarray:
+        template = cv2.imread(str(ROOF_TEMPLATE_FILE), cv2.IMREAD_GRAYSCALE)
+        frame = np.full((1440, 2560), 120, dtype=np.uint8)
+        left = ROOF_CORNER_REFERENCE[0] - ROOF_TEMPLATE_BEFORE + shift[0]
+        top = ROOF_CORNER_REFERENCE[1] - ROOF_TEMPLATE_BEFORE + shift[1]
+        size = template.shape[0]
+        frame[top : top + size, left : left + size] = template
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+    def test_follows_camera_shift_and_ignores_missing_corner(self) -> None:
+        tracker = RoofCornerTracker(25.0)
+        self.assertTrue(tracker.update(self.frame_with_corner((-5, 4))))
+        self.assertEqual(tracker.shift, (-5, 4))
+        self.assertFalse(tracker.update(self.frame_with_corner((-5, 4))))
+        blank = np.full((1440, 2560, 3), 120, dtype=np.uint8)
+        self.assertFalse(tracker.update(blank))
+        self.assertEqual(tracker.shift, (-5, 4))
 
 
 if __name__ == "__main__":

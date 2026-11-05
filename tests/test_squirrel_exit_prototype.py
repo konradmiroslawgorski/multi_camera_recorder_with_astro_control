@@ -241,7 +241,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
 
         self.assertEqual(appearances, [Appearance(start_frame=1)])
 
-    def test_sparse_sampling_confirms_with_two_of_three_samples(self) -> None:
+    def test_sparse_sampling_confirms_with_two_of_four_samples(self) -> None:
         detector = AppearanceDetector(fps=12, frame_step=4)
         results = [
             detector.update(index * 4, detected)
@@ -250,6 +250,17 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
 
         self.assertEqual(
             [r for r in results if r is not None], [Appearance(start_frame=4)]
+        )
+
+    def test_sparse_sampling_counts_hits_across_four_samples(self) -> None:
+        detector = AppearanceDetector(fps=12, frame_step=12)
+        results = [
+            detector.update(index * 12, detected)
+            for index, detected in enumerate([True, False, False, True])
+        ]
+
+        self.assertEqual(
+            [r for r in results if r is not None], [Appearance(start_frame=0)]
         )
 
     def test_appearance_detector_rearms_after_activity_disappears(self) -> None:

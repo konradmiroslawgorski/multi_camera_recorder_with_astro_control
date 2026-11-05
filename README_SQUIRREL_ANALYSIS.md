@@ -57,13 +57,13 @@ pliku prototypu.
    które tylko nieco przyciemniają jasną ścianę (wiewiórka jest wielokrotnie
    ciemniejsza); rozjaśnienia i szum są pomijane.
 7. **Filtry regionów.** Zmiany są otaczane prostokątami. Prostokąt jest brany
-   pod uwagę, gdy jego **przekątna > 18 px** (`--min-diagonal-px`), **krótszy
+   pod uwagę, gdy jego **przekątna > 14 px** (`--min-diagonal-px`), **krótszy
    bok ≥ 5 px** (odrzuca cienkie drgania krawędzi) i **proporcje ≤ 6:1**
    (odrzuca długie pasy, np. krawędzie elewacji). Mniejsze obszary są
    odrzucane.
 8. **Potwierdzenie.** Analizowana jest co 12. klatka (`--frame-step`, 1 próbka na sekundę przy
    12 kl./s; `1` = każda klatka, wolniej). Pojawienie się wiewiórki jest
-   zgłaszane, gdy w ≥ 2 z ostatnich 3 próbek (przy `--frame-step 1`: ≥ 3 z 5
+   zgłaszane, gdy w ≥ 2 z ostatnich 4 próbek (przy `--frame-step 1`: ≥ 3 z 5
    klatek) jest co najmniej jeden taki prostokąt. Początkiem zdarzenia jest
    pierwsza z tych klatek. Kolejne zdarzenie jest możliwe dopiero po ≥ 1,5 s
    bez dużego regionu. Skutek rzadszej analizy: bardzo krótkie przeloty

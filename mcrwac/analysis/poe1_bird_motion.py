@@ -20,7 +20,19 @@ import cv2
 import numpy as np
 
 
-DEFAULT_POLYGON = ((830, 481), (986, 440), (1082, 853), (947, 909))
+# Obszar badania na ciemnym podbiciu dachu; współrzędne dla ROOF_CORNER_REFERENCE.
+DEFAULT_POLYGON = ((1088, 605), (1318, 564), (1462, 1133), (1258, 1187))
+# Prawy dolny róg dachu na tle nieba; wzorzec to wycinek 160x160 px
+# (od rogu: 110 px w lewo i w górę, 50 px w prawo i w dół).
+ROOF_CORNER_REFERENCE = (1473, 1148)
+ROOF_TEMPLATE_FILE = Path(__file__).parent / "reference" / "poe1_roof_corner.png"
+ROOF_TEMPLATE_BEFORE = 110
+ROOF_TEMPLATE_SIZE = 160
+ROOF_MIN_SCORE = 0.35
+ROOF_LOCAL_RADIUS_PX = 8
+ROOF_WIDE_RADIUS_PX = 60
+ROOF_WIDE_SEARCH_SECONDS = 5.0
+ROOF_MOVE_TOLERANCE_PX = 2
 DEFAULT_LAGS = (1, 3)
 DEFAULT_THRESHOLDS = (12, 20, 32)
 DEFAULT_CLIP_BEFORE_SECONDS = 1.0
@@ -270,6 +282,89 @@ class MotionMetrics:
     largest_component: int
 
 
+def _edge_map(gray: np.ndarray) -> np.ndarray:
+    """Mapa krawędzi niezależna od jasności (świt, słońce, pochmurno)."""
+    gray = cv2.GaussianBlur(cv2.createCLAHE(3.0, (8, 8)).apply(gray), (0, 0), 1.2)
+    return cv2.magnitude(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0), cv2.Sobel(gray, cv2.CV_32F, 0, 1)
+    )
+
+
+class RoofCornerTracker:
+    """Śledzi róg dachu, żeby obszar badania podążał za przesuwającą się kamerą.
+
+    Co klatkę szuka wzorca w małym oknie wokół ostatniej pozycji; co
+    `ROOF_WIDE_SEARCH_SECONDS` (i gdy rogu nie widać) w szerokim oknie. Gdy
+    dopasowanie jest za słabe (noc, mgła), zostaje ostatnia pozycja.
+    """
+
+    def __init__(self, fps: float) -> None:
+        image = cv2.imread(str(ROOF_TEMPLATE_FILE), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise RuntimeError(f"Missing roof corner template: {ROOF_TEMPLATE_FILE}")
+        self._template = _edge_map(image)
+        self._wide_every = max(1, int(round(fps * ROOF_WIDE_SEARCH_SECONDS)))
+        self.corner = ROOF_CORNER_REFERENCE
+        self.score = 0.0
+        self._frames_since_wide = 0
+        self._lost = True
+
+    @property
+    def shift(self) -> tuple[int, int]:
+        return (
+            self.corner[0] - ROOF_CORNER_REFERENCE[0],
+            self.corner[1] - ROOF_CORNER_REFERENCE[1],
+        )
+
+    def _search(
+        self, gray: np.ndarray, radius: int
+    ) -> tuple[float, tuple[int, int]] | None:
+        x1 = self.corner[0] - ROOF_TEMPLATE_BEFORE - radius
+        y1 = self.corner[1] - ROOF_TEMPLATE_BEFORE - radius
+        size = ROOF_TEMPLATE_SIZE + 2 * radius
+        if x1 < 0 or y1 < 0 or x1 + size > gray.shape[1] or y1 + size > gray.shape[0]:
+            return None
+        match = cv2.matchTemplate(
+            _edge_map(gray[y1 : y1 + size, x1 : x1 + size]),
+            self._template,
+            cv2.TM_CCOEFF_NORMED,
+        )
+        _, score, _, location = cv2.minMaxLoc(match)
+        return float(score), (
+            x1 + location[0] + ROOF_TEMPLATE_BEFORE,
+            y1 + location[1] + ROOF_TEMPLATE_BEFORE,
+        )
+
+    def update(self, frame: np.ndarray) -> bool:
+        """Aktualizuje pozycję rogu; True, gdy obszar badania trzeba przesunąć."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._frames_since_wide += 1
+        wide = self._lost or self._frames_since_wide >= self._wide_every
+        result = self._search(
+            gray, ROOF_WIDE_RADIUS_PX if wide else ROOF_LOCAL_RADIUS_PX
+        )
+        if wide:
+            self._frames_since_wide = 0
+        if result is None or result[0] < ROOF_MIN_SCORE:
+            self._lost = True
+            return False
+        self._lost = False
+        self.score, position = result
+        if (
+            abs(position[0] - self.corner[0]) >= ROOF_MOVE_TOLERANCE_PX
+            or abs(position[1] - self.corner[1]) >= ROOF_MOVE_TOLERANCE_PX
+        ):
+            self.corner = position
+            return True
+        return False
+
+
+def shift_polygon(
+    polygon: Sequence[tuple[int, int]], shift: tuple[int, int]
+) -> list[tuple[int, int]]:
+    return [(x + shift[0], y + shift[1]) for x, y in polygon]
+
+
 @dataclass
 class DetectionSnapshot:
     last_candidate_seconds: float
@@ -278,6 +373,7 @@ class DetectionSnapshot:
     previous_gray: np.ndarray
     current_gray: np.ndarray
     metrics: MotionMetrics
+    shift: tuple[int, int] = (0, 0)
 
 
 def save_roi_visualization(
@@ -745,10 +841,26 @@ def analyze_video(
     polygon_mask = np.zeros((height, width), dtype=np.uint8)
     cv2.fillPoly(polygon_mask, [polygon_array - np.array([x, y])], 255)
 
+    tracker = RoofCornerTracker(capture.get(cv2.CAP_PROP_FPS) or 25.0)
+    roi_origin = [x, y]
+    current_shift = (0, 0)
+
     def to_roi_gray(frame: np.ndarray) -> np.ndarray:
+        left, top = roi_origin
         return cv2.cvtColor(
-            frame[y : y + height, x : x + width], cv2.COLOR_BGR2GRAY
+            frame[top : top + height, left : left + width], cv2.COLOR_BGR2GRAY
         )
+
+    def apply_shift() -> bool:
+        """Przesuwa ROI za rogiem dachu; False, gdy wyszłoby poza kadr."""
+        nonlocal current_shift
+        shift = tracker.shift
+        left, top = x + shift[0], y + shift[1]
+        if left < 0 or top < 0 or left + width > frame_width or top + height > frame_height:
+            return False
+        roi_origin[:] = [left, top]
+        current_shift = shift
+        return True
 
     analysis_ranges = [(0.0, video_duration)]
     if noise_filter:
@@ -811,7 +923,7 @@ def analyze_video(
             snapshot.frame,
             snapshot.previous_gray,
             snapshot.current_gray,
-            polygon,
+            shift_polygon(polygon, snapshot.shift),
             polygon_mask,
             lag,
             snapshot.peak_seconds,
@@ -844,9 +956,16 @@ def analyze_video(
                 current_frame_index = frame_index
                 frame_index += 1
                 if current_frame_index == 0:
+                    tracker.update(frame)
+                    apply_shift()
+                    print(
+                        f"Roof corner {tracker.corner} "
+                        f"(shift {current_shift}, score {tracker.score:.2f})",
+                        flush=True,
+                    )
                     save_roi_visualization(
                         frame,
-                        polygon,
+                        shift_polygon(polygon, current_shift),
                         polygon_mask,
                         visualization_dir / f"{video_path.stem}_roi.jpg",
                     )
@@ -870,6 +989,19 @@ def analyze_video(
                 if not range_active:
                     range_active = True
                     history.clear()
+                if current_frame_index > 0 and tracker.update(frame):
+                    if apply_shift():
+                        print(
+                            f"[{frame_seconds:.1f}s] Roof corner moved to "
+                            f"{tracker.corner}; ROI shift {current_shift}",
+                            flush=True,
+                        )
+                        history.clear()
+                    else:
+                        tracker.corner = (
+                            ROOF_CORNER_REFERENCE[0] + current_shift[0],
+                            ROOF_CORNER_REFERENCE[1] + current_shift[1],
+                        )
                 if frame_seconds < skip_until_seconds:
                     history.clear()
                     continue
@@ -909,6 +1041,7 @@ def analyze_video(
                                     previous_gray=history[-lag].copy(),
                                     current_gray=gray.copy(),
                                     metrics=metrics,
+                                    shift=current_shift,
                                 )
                             else:
                                 snapshot.last_candidate_seconds = frame_seconds
@@ -921,6 +1054,7 @@ def analyze_video(
                                     snapshot.previous_gray = history[-lag].copy()
                                     snapshot.current_gray = gray.copy()
                                     snapshot.metrics = metrics
+                                    snapshot.shift = current_shift
                         row.extend(
                             [
                                 round(metrics.mean_abs_difference, 3),
