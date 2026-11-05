@@ -78,13 +78,13 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
 
         # Lokalne przyciemnienie jasnej ściany (cień) nie jest wiewiórką.
         shadow = frame.copy()
-        shadow[60:110, 140:160] = (shadow[60:110, 140:160] * 0.8).astype(np.uint8)
+        shadow[130:170, 136:148] = (shadow[130:170, 136:148] * 0.8).astype(np.uint8)
         mask, _, _ = _activity_mask(shadow, reference_gray, opening, tracked)
         self.assertEqual(cv2.countNonZero(mask), 0)
 
         # Ciemny obiekt tej samej wielkości musi być widoczny.
         dark = frame.copy()
-        dark[60:110, 140:160] = (20, 20, 20)
+        dark[130:170, 136:148] = (20, 20, 20)
         mask, _, _ = _activity_mask(dark, reference_gray, opening, tracked)
         self.assertGreater(cv2.countNonZero(mask), 300)
 
@@ -169,7 +169,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         cv2.rectangle(mask, (20, 10), (28, 38), 255, -1)
         cv2.rectangle(mask, (40, 20), (55, 50), 255, -1)
 
-        regions, largest_diagonal = activity_regions(mask, min_diagonal_px=30)
+        regions, largest_diagonal = activity_regions(mask, min_diagonal_px=30, min_side_px=12)
 
         self.assertEqual(len(regions), 1)
         self.assertEqual((regions[0].width, regions[0].height), (16, 31))
@@ -450,6 +450,24 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             )
         starts = [item.start_frame for item in results if item is not None]
         self.assertEqual(starts, [1000])
+
+    def test_size_detector_ignores_long_lasting_change(self) -> None:
+        rng = np.random.default_rng(1)
+        detector = OpeningSizeDetector(fps=10.0)
+        wall = np.full((300, 300, 3), 170, dtype=np.uint8)
+
+        def frame(dark: bool) -> np.ndarray:
+            image = wall.copy()
+            image += rng.integers(0, 3, image.shape, dtype=np.uint8)
+            if dark:
+                cv2.rectangle(image, (140, 140), (160, 168), (20, 20, 20), -1)
+            return image
+
+        results = [
+            detector.update(second * 10, frame(100 <= second < 400), 150, 150)
+            for second in range(0, 600, 10)
+        ]
+        self.assertEqual([item for item in results if item is not None], [])
 
     def test_next_pending_respects_hours_range(self) -> None:
         now = 1_800_000_000.0

@@ -5,7 +5,7 @@ Uzupełnienie [README_SQUIRREL_ANALYSIS.md](README_SQUIRREL_ANALYSIS.md). Opisuj
 ## 1. Cel i założenia
 
 - Kamera POE_BRAMA (2304×1296, 12 kl./s) nagrywa ścianę z małym otworem (ok. 10×15 px). Wiewiórka wychodzi z otworu.
-- Analiza jest **offline** (po nagraniu), nie wpływa na rejestrator. Wynik: klipy 3 min od wykrycia, CSV, lista przeanalizowanych plików.
+- Analiza jest **offline** (po nagraniu), nie wpływa na rejestrator. Wynik: klipy 1 min od wykrycia (analiza przeskakuje za klip), CSV, lista przeanalizowanych plików.
 - Wymagania: Python 3.10, `numpy`, `opencv-python`, `ffmpeg` w PATH (klipy), `pip install -r requirements.txt` do `venv_motion`.
 - Nagrania: `/opt/cameras/recordings/<KAMERA>/RRRR-MM-DD/GG-MM-SS.mkv` (czas startu w nazwie, segmenty ok. 30 min). Wyniki: `/opt/cameras/recordings/analysis/RRRR-MM-DD/POE_BRAMA_wiewiorki/`.
 - Kamera po restarcie zmienia położenie (25.10 otwór ≈ (999, 793); 26–27.10 ≈ (347, 744)), a światło zmienia się od pochmurnego po pełne słońce i błękitne niebo. Stąd lokalizacja otworu na każdym pliku, nie stałe współrzędne.
@@ -44,12 +44,12 @@ Przepływ `analyze_video`: odczyt metadanych → `_find_opening` → pętla klat
 ## 4. Wykrywanie wiewiórki
 
 - **Śledzenie**: szablon 96×96 px (`TEMPLATE_RADIUS = 48`) z klatki wzorca, `TM_CCOEFF_NORMED`, szukanie ±32 px; pewność < 0,6 → klatka pomijana; brak otworu przez 15 s → ponowne szukanie.
-- **ROI**: ±45 px poziomo, 60 px w górę, 80 px w dół od otworu.
+- **ROI**: ±16 px poziomo, 24 px w górę, 24 px w dół (32×48 px) od otworu.
 - **Tło adaptacyjne**: start z wzorca; `accumulateWeighted` α = 0,01; piksele zmienione są zamrożone do 30 s, dłuższa zmiana (światło) wchodzi do tła.
 - **Maska**: od różnicy odjęta mediana (globalna ekspozycja); piksel aktywny, gdy `tło − obraz > 25` **i** `obraz < tło × 0,65`; rozmycie 3×3, otwarcie morfologiczne 3×3.
-- **Regiony**: przekątna > 30 px, krótszy bok ≥ 12 px, proporcje ≤ 6.
+- **Regiony**: przekątna > 18 px, krótszy bok ≥ 5 px, proporcje ≤ 6.
 - **Decyzja**: przy `--frame-step 1` okno 5 klatek / 3 trafienia; przy kroku > 1 okno 3 / 2 trafienia; zwolnienie po przerwie 1,5 s.
-- Domyślnie `--frame-step 4` (≈ 3 analizowane kl./s): szybciej (klip 60 s: 42 s zamiast 60 s) i nadal łapie wrony; kosztem przelotów < ok. 0,7 s i zdarzeń granicznych.
+- Domyślnie `--frame-step 12` (≈ 1 próbka na sekundę, okno 3 próbek / 2 trafienia): wiewiórka na ścianie porusza się bardzo wolno, a krótkie przeloty (wrony) nie są celem.
 
 ## 5. Uzasadnienia i historia strojenia
 
@@ -57,7 +57,7 @@ Przepływ `analyze_video`: odczyt metadanych → `_find_opening` → pętla klat
 |---|---|---|
 | `MIN_DARKENING_RATIO` | 0,65 | Fałszywy alarm w 14-30-24 (zmiana tła/cień od słońca): obraz tylko nieco ciemniejszy. Prawdziwa wiewiórka: region ok. 15×27–16×31 px, 95–99% pikseli < 60. Dla 0,6 wykrycie spóźnione (51,2 s zamiast 45,7 s); 0,7 daje 0 fałszywych; 0,75 → 81, 0,8 → 216 fałszywych regionów |
 | `DEFAULT_MIN_DIAGONAL_PX` | 30 | Odsiewa szum i drobne cienie; prawdziwa wiewiórka ma ok. 31–35 px |
-| `DEFAULT_CLIP_SECONDS` | 180 | 60 s było za mało |
+| `DEFAULT_CLIP_SECONDS` | 60 | klip i jednocześnie przeskok analizy po wykryciu |
 | `SEARCH_GRID_SECONDS` | 60 | Kompromis szybkość/ryzyko pominięcia okien widoczności < 60 s |
 | `SEARCH_RETRY_SECONDS` | 15 | Dokładność bisekcji |
 | `ANCHOR_MIN_SCORE` | 0,58 | Fałszywe trafienia nocą miały 0,53–0,57; dodatkowo odrzuca je geometria |
@@ -86,6 +86,6 @@ Pliki kontrolne: `2026-10-25/05-49-02-18-19.mkv` (klip, wiewiórka ok. 45,7 s), 
 - Brak planu B: gdy komin lub szczyt dachu są poza kadrem, zasłonięte lub kamera obrócona o > 15°, otworu nie znajdzie. Wzorce pochodzą z jednego dnia (`11-52-43`); inne pory sprawdzono tylko częściowo.
 - Nocą komin widać późno (`05-22-27`: od ok. 1500 s); obniżenie `ANCHOR_MIN_SCORE` do ok. 0,55 dałoby wcześniejsze wykrycie (nie sprawdzono).
 - Okna widoczności otworu krótsze niż 60 s mogą zostać pominięte; bardzo jasna wiewiórka na jasnym tle byłaby pominięta.
-- Krok 4 może gubić przeloty < 0,7 s; `--frame-step 1` łapie więcej zdarzeń granicznych.
+- Krok 12 gubi przeloty < ok. 2 s; `--frame-step 1` łapie więcej zdarzeń granicznych.
 - `--watch` nie obejmuje starszych dni; pomysł: `--since RRRR-MM-DD`.
 - Pomysły: powiadomienie ntfy po wykryciu, automatyczne tworzenie wzorców, wnioskowanie o oświetleniu zamiast stałej 0,65.

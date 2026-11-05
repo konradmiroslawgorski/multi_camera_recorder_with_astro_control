@@ -75,16 +75,16 @@ SEARCH_RADIUS = 32
 BACKGROUND_ALPHA = 0.01
 MIN_DARKENING_RATIO = 0.65
 BACKGROUND_FREEZE_SECONDS = 30.0
-ROI_HALF_WIDTH = 45
-ROI_TOP = 60
-ROI_BOTTOM = 80
-DEFAULT_MIN_DIAGONAL_PX = 30.0
-MIN_REGION_SIDE_PX = 12
+ROI_HALF_WIDTH = 16
+ROI_TOP = 24
+ROI_BOTTOM = 24
+DEFAULT_MIN_DIAGONAL_PX = 18.0
+MIN_REGION_SIDE_PX = 5
 MAX_REGION_ASPECT = 6.0
 DEFAULT_ANALYSIS_OUTPUT_DIR = Path("/opt/cameras/recordings/analysis")
 ANALYSIS_SUBDIR = "POE_BRAMA_wiewiorki"
-DEFAULT_CLIP_SECONDS = 180.0
-DEFAULT_FRAME_STEP = 4
+DEFAULT_CLIP_SECONDS = 60.0
+DEFAULT_FRAME_STEP = 12
 WATCH_POLL_SECONDS = 30.0
 WATCH_SETTLE_SECONDS = 120.0
 ANALYZED_LIST_NAME = "analyzed.txt"
@@ -103,13 +103,20 @@ SEARCH_RETRY_SECONDS = 15.0
 SEARCH_GRID_SECONDS = 60.0
 LOST_TRACKING_SECONDS = 15.0
 ANCHOR_SEARCH_RADIUS_PX = 120.0
+SIZE_DETECTOR_ENABLED = False
+# Kamera co ok. 4 s odświeża cały obraz (skok szumu i tekstury ściany o kilka
+# poziomów szarości); zwykła różnica między klatkami wynosi < 1, skok ok. 4,5.
+CAMERA_JUMP_THRESHOLD = 2.5
+CAMERA_JUMP_HALF_WIDTH = 300
+CAMERA_JUMP_HALF_HEIGHT = 200
 SIZE_SAMPLE_SECONDS = 10.0
 SIZE_HISTORY_SAMPLES = 30
 SIZE_MIN_HISTORY = 6
 SIZE_WINDOW_HALF_WIDTH = 22
 SIZE_WINDOW_HALF_HEIGHT = 30
-SIZE_MIN_DARK_PX = 150
-SIZE_GROWTH_FACTOR = 2.5
+SIZE_MIN_DARK_PX = 400
+SIZE_MAX_EVENT_SECONDS = 120.0
+SIZE_GROWTH_FACTOR = 5.0
 
 
 def _sample_calibration_frames(
@@ -545,7 +552,9 @@ class OpeningSizeDetector:
     Co SIZE_SAMPLE_SECONDS liczy ciemne piksele w małym oknie wokół otworu
     względem mediany ostatnich próbek (ok. 5 min). Zdarzenie, gdy ich liczba jest
     co najmniej SIZE_GROWTH_FACTOR razy większa niż zwykle i nie mniejsza niż
-    SIZE_MIN_DARK_PX. Łapie wiewiórkę, która rusza się zbyt wolno dla porównania
+    SIZE_MIN_DARK_PX. Zdarzenie jest zgłaszane dopiero po powrocie do normy i
+    tylko gdy powiększenie trwało krócej niż SIZE_MAX_EVENT_SECONDS; dłuższe to
+    zmiana światła, po której baza porównawcza budowana jest od nowa. Łapie wiewiórkę, która rusza się zbyt wolno dla porównania
     klatek z tłem adaptacyjnym albo jest mała.
     """
 
@@ -555,6 +564,16 @@ class OpeningSizeDetector:
         self._history: deque[np.ndarray] = deque(maxlen=SIZE_HISTORY_SAMPLES)
         self._counts: deque[int] = deque(maxlen=SIZE_HISTORY_SAMPLES)
         self._active = False
+        self._run_start: Optional[int] = None
+        self._max_run_frames = int(round(fps * SIZE_MAX_EVENT_SECONDS))
+
+    def rearm(self) -> None:
+        # Po przeskoku analizy baza porównawcza jest nieaktualna, więc budowana od nowa.
+        self._active = False
+        self._run_start = None
+        self._next_sample_frame = 0
+        self._history.clear()
+        self._counts.clear()
 
     def update(
         self, frame_index: int, frame: np.ndarray, x: int, y: int
@@ -578,18 +597,36 @@ class OpeningSizeDetector:
             )
             usual = float(np.median(self._counts)) if self._counts else 0.0
             enlarged = count >= max(SIZE_MIN_DARK_PX, SIZE_GROWTH_FACTOR * usual)
-            if enlarged and not self._active:
-                appearance = Appearance(start_frame=frame_index)
             if enlarged:
-                # Powiększona dziura nie zawyża „zwykłego” poziomu.
-                self._active = True
-            else:
-                self._active = False
-                self._counts.append(count)
-            if enlarged:
-                return appearance
+                if self._run_start is None:
+                    self._run_start = frame_index
+                if frame_index - self._run_start > self._max_run_frames:
+                    # Trwała zmiana (światło, cień), nie zwierzę.
+                    self._run_start = None
+                    self._history.clear()
+                    self._counts.clear()
+                return None
+            self._counts.append(count)
+            if self._run_start is not None:
+                appearance = Appearance(start_frame=self._run_start)
+                self._run_start = None
         self._history.append(window)
         return appearance
+
+
+def _jump_window(frame: np.ndarray, opening: OpeningCandidate) -> np.ndarray:
+    """Szary, szeroki wycinek wokół otworu do wykrywania skoku obrazu kamery."""
+    center_x, center_y = int(round(opening.x)), int(round(opening.y))
+    x1 = max(0, center_x - CAMERA_JUMP_HALF_WIDTH)
+    y1 = max(0, center_y - CAMERA_JUMP_HALF_HEIGHT)
+    window = frame[y1:center_y + CAMERA_JUMP_HALF_HEIGHT, x1:center_x + CAMERA_JUMP_HALF_WIDTH]
+    return cv2.cvtColor(window, cv2.COLOR_BGR2GRAY)
+
+
+def is_camera_jump(previous: Optional[np.ndarray], current: np.ndarray) -> bool:
+    if previous is None or previous.shape != current.shape:
+        return False
+    return float(cv2.absdiff(previous, current).mean()) > CAMERA_JUMP_THRESHOLD
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -729,7 +766,7 @@ def _save_appearance_clips(
 def analyze_video(
     video_path: Path,
     output_path: Optional[Path] = None,
-    mode: str = "first",
+    mode: str = "all",
     min_diagonal_px: float = DEFAULT_MIN_DIAGONAL_PX,
     clip_seconds: float = DEFAULT_CLIP_SECONDS,
     save_preview: bool = False,
@@ -787,6 +824,8 @@ def analyze_video(
     reference_gray: Optional[np.ndarray] = None
     background: Optional[AdaptiveBackground] = None
     lost_frames = 0
+    previous_window: Optional[np.ndarray] = None
+    interval_jump = False
     try:
         with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
             rows = csv.writer(csv_file)
@@ -822,6 +861,8 @@ def analyze_video(
                     detector = AppearanceDetector(fps, frame_step)
                     size_detector = OpeningSizeDetector(fps)
                     capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                    previous_window = None
+                    interval_jump = False
                     _log(
                         f"[{_format_elapsed(frame_index / fps)}] Otwór widoczny: "
                         f"({opening.x:.1f}, {opening.y:.1f}); analiza.",
@@ -837,9 +878,24 @@ def analyze_video(
                 lost_frames = (
                     lost_frames + 1 if tracked.confidence < MIN_TRACK_CONFIDENCE else 0
                 )
-                mask, bounds, changed_ratio = _activity_mask(
-                    frame, reference_gray, opening, tracked, background
+                current_window = _jump_window(frame, opening)
+                camera_jump = interval_jump or is_camera_jump(
+                    previous_window, current_window
                 )
+                previous_window = current_window
+                interval_jump = False
+                if camera_jump and tracked.confidence >= MIN_TRACK_CONFIDENCE:
+                    # Po odświeżeniu obrazu przez kamerę próbka jest pomijana,
+                    # a tło okna zaczyna się od nowego obrazu.
+                    mask, bounds, changed_ratio = None, None, 0.0
+                    background = _reference_window(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+                        OpeningCandidate(tracked.x, tracked.y, 1.0),
+                    )
+                else:
+                    mask, bounds, changed_ratio = _activity_mask(
+                        frame, reference_gray, opening, tracked, background
+                    )
                 regions: list[ActivityRegion] = []
                 largest_diagonal = 0.0
                 if mask is not None:
@@ -847,7 +903,7 @@ def analyze_video(
                     if background is not None and bounds is not None:
                         _update_background(background, frame, bounds, mask, analyzed_fps)
                 appearance = detector.update(frame_index, bool(regions))
-                if mask is not None:
+                if SIZE_DETECTOR_ENABLED and mask is not None:
                     size_appearance = size_detector.update(
                         frame_index, frame, tracked.x, tracked.y
                     )
@@ -935,7 +991,23 @@ def analyze_video(
                 if appearance is not None and mode == "first":
                     break
                 for _ in range(frame_step - 1):
-                    capture.grab()
+                    skipped_ok, skipped = capture.read()
+                    if not skipped_ok:
+                        break
+                    skipped_window = _jump_window(skipped, opening)
+                    if is_camera_jump(previous_window, skipped_window):
+                        interval_jump = True
+                    previous_window = skipped_window
+                if appearance is not None:
+                    # Klip pokrywa następną minutę, więc analiza zaczyna się dopiero za nim.
+                    resume_frame = appearance.start_frame + int(round(fps * clip_seconds))
+                    if resume_frame > frame_index:
+                        frame_index = resume_frame
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                        previous_window = None
+                        interval_jump = False
+                    detector = AppearanceDetector(fps, frame_step)
+                    size_detector.rearm()
                 if lost_frames >= lost_limit:
                     _log(
                         f"[{_format_elapsed(frame_index / fps)}] Otwór przestał być "
@@ -1313,9 +1385,9 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         choices=("first", "all"),
-        default="first",
-        help="first: zatrzymaj analizę po pierwszym wykryciu (domyślnie); "
-        "all: analizuj cały film i zapisz wszystkie wykrycia",
+        default="all",
+        help="all: analizuj cały film i zapisz wszystkie wykrycia (domyślnie); "
+        "first: zatrzymaj analizę po pierwszym wykryciu",
     )
     parser.add_argument(
         "--min-diagonal-px",

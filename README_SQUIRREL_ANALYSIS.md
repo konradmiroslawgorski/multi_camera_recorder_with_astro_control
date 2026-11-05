@@ -45,8 +45,8 @@ pliku prototypu.
    Po ok. 15 s takich klatek otwór uznaje się za utracony i program wraca do
    kroku 1, szukając od miejsca utraty, aż komin i szczyt dachu będą znowu
    widoczne.
-5. **Tło.** Obszar analizy to okno wokół otworu: ±45 px w poziomie, 60 px w górę
-   i 80 px w dół. Jego tło startuje z klatki odniesienia i jest powoli
+5. **Tło.** Obszar analizy to okno wokół otworu: ±16 px w poziomie, 24 px w górę
+   i 24 px w dół. Jego tło startuje z klatki odniesienia i jest powoli
    aktualizowane (współczynnik 0,01), więc zmiany oświetlenia nie dają alarmu.
    Piksele, w których wykryto zmianę, są zamrożone (wiewiórka nie wtapia się w
    tło), ale zmiana trwająca ponad 30 s uchodzi za trwałą i trafia do tła.
@@ -57,28 +57,29 @@ pliku prototypu.
    które tylko nieco przyciemniają jasną ścianę (wiewiórka jest wielokrotnie
    ciemniejsza); rozjaśnienia i szum są pomijane.
 7. **Filtry regionów.** Zmiany są otaczane prostokątami. Prostokąt jest brany
-   pod uwagę, gdy jego **przekątna > 30 px** (`--min-diagonal-px`), **krótszy
-   bok ≥ 12 px** (odrzuca cienkie drgania krawędzi) i **proporcje ≤ 6:1**
+   pod uwagę, gdy jego **przekątna > 18 px** (`--min-diagonal-px`), **krótszy
+   bok ≥ 5 px** (odrzuca cienkie drgania krawędzi) i **proporcje ≤ 6:1**
    (odrzuca długie pasy, np. krawędzie elewacji). Mniejsze obszary są
    odrzucane.
-8. **Potwierdzenie.** Analizowana jest co 4. klatka (`--frame-step`, ok. 3 próbki
-   na sekundę; `1` = każda klatka, wolniej). Pojawienie się wiewiórki jest
+8. **Potwierdzenie.** Analizowana jest co 12. klatka (`--frame-step`, 1 próbka na sekundę przy
+   12 kl./s; `1` = każda klatka, wolniej). Pojawienie się wiewiórki jest
    zgłaszane, gdy w ≥ 2 z ostatnich 3 próbek (przy `--frame-step 1`: ≥ 3 z 5
    klatek) jest co najmniej jeden taki prostokąt. Początkiem zdarzenia jest
    pierwsza z tych klatek. Kolejne zdarzenie jest możliwe dopiero po ≥ 1,5 s
    bez dużego regionu. Skutek rzadszej analizy: bardzo krótkie przeloty
-   (poniżej ok. 0,7 s) mogą zostać pominięte.
-8a. **Pomiar wielkości dziury (wolna wiewiórka).** Co 10 s program liczy ciemne
-    piksele w małym oknie wokół otworu (±22 × ±30 px) względem mediany ostatnich
-    próbek (ok. 5 min). Gdy jest ich ≥ 150 i ≥ 2,5× więcej niż zwykle, zgłasza
-    zdarzenie, nawet gdy wiewiórka rusza się zbyt wolno albo jest zbyt mała dla
-    kroku 7. Nie dubluje zdarzeń w obrębie długości klipu.
+   (poniżej ok. 2 s) mogą zostać pominięte.
+8a. **Pomiar wielkości dziury (wyłączony).** Detektor liczący ciemne piksele
+    wokół otworu (`OpeningSizeDetector`) jest wyłączony przez
+    `SIZE_DETECTOR_ENABLED = False`, bo zmienne oświetlenie dawało fałszywe
+    zdarzenia. Wiewiórkę wykrywa wyłącznie detektor ruchu.
     Wyszukiwanie komina i szczytu dachu najpierw sprawdza okolice wzorcowych
     położeń (±120 px, próg 0,50), co ratuje świt, gdy dopasowanie jest słabe.
-9. **Tryby.** `first` (domyślny) kończy analizę po pierwszym zdarzeniu; `all`
-   analizuje cały film i zapisuje każde pojawienie się.
+9. **Tryby.** `all` (domyślny) analizuje cały film i zapisuje każde pojawienie się;
+   `first` kończy analizę po pierwszym zdarzeniu.
 10. **Wyniki.** Dla każdego zdarzenia ffmpeg wycina klip od początku zdarzenia
-    (domyślnie 180 s, `--clip-seconds`; krótszy, jeśli film się kończy). Pełny
+    (domyślnie 60 s, `--clip-seconds`; krótszy, jeśli film się kończy). Po klipie
+    analiza przeskakuje o tyle samo, więc wiewiórka siedząca dalej przy dziurze
+    daje kolejny klip. Pełny
     podgląd MP4 powstaje tylko z `--save-preview`; CSV zostaje, gdy było
     wykrycie (albo z `--save-preview`). Bez wykrycia nie zostaje nic.
 
@@ -100,9 +101,8 @@ Przykład dla nagrania z serwera:
   /opt/cameras/recordings/POE_BRAMA/2026-10-25/05-49-02-5-25.mkv
 ```
 
-Domyślnie analiza zatrzymuje się po pierwszym wykryciu (`--mode first`). Aby
-przeanalizować cały film i zapisać wszystkie wykryte pojawienia się, użyj
-`--mode all`. Próg przekątnej można dostroić opcją `--min-diagonal-px`, a
+Domyślnie analiza przetwarza cały film i zapisuje wszystkie wykryte pojawienia
+się (`--mode all`). Aby zatrzymać ją po pierwszym wykryciu, użyj `--mode first`. Próg przekątnej można dostroić opcją `--min-diagonal-px`, a
 długość klipu opcją `--clip-seconds`, na przykład:
 
 ```bash
@@ -162,8 +162,8 @@ tryb `all` z 4 wykrytymi zdarzeniami, przy równoległym obciążeniu maszyny):
 cały przebieg trwał 17,7 min zegarowo (13,4 min czasu procesora), z czego sama
 pętla analizy ok. 5 min, a reszta to cięcie czterech klipów ffmpeg
 (przekodowanie H.264). Kolejka z jednym procesem mieści się więc w czasie
-nagrywania (nowy plik co 30 min), a w domyślnym trybie `first` powstaje najwyżej
-jeden klip na plik.
+nagrywania (nowy plik co 30 min), a w trybie `first` powstaje najwyżej jeden klip
+na plik (w domyślnym `all` tyle klipów, ile zdarzeń).
 
 ### Pliki wynikowe
 
@@ -176,7 +176,7 @@ tworzony automatycznie), a nazwy mają postać
 |------|-------|-----------|
 | Podgląd (tylko `--save-preview`) | `<nagranie>_analysis_<czas startu nagrania>.mp4` | cały film: klatki z oznaczonym otworem, obszarem analizy i prostokątami (z przekątną w px); rozdzielczość o połowę mniejsza, kodek mp4v |
 | CSV (gdy było wykrycie lub `--save-preview`) | `<nagranie>_analysis_<czas startu nagrania>.csv` | wiersz na klatkę: `czas_s` (czas w nagraniu źródłowym), `x_otworu`, `y_otworu`, `pewnosc_sledzenia`, `zmieniony_obszar`, `najwieksza_przekatna_px`, `duze_obszary`, `zdarzenie` (`wykryto` w klatce potwierdzenia) |
-| Klip | `<nagranie>_<czas zdarzenia>.mkv` | fragment źródła od początku zdarzenia (domyślnie 180 s), wideo H.264, dźwięk AAC |
+| Klip | `<nagranie>_<czas zdarzenia>.mkv` | fragment źródła od początku zdarzenia (domyślnie 60 s), wideo H.264, dźwięk AAC |
 
 Czas w nazwie (`RRRRMMDDGGMMSS`, np. `20261026133021`) liczony jest z katalogu
 daty i godziny w nazwie pliku (`2026-10-26/13-00-08.mkv`); dla klipu dodatkowo
