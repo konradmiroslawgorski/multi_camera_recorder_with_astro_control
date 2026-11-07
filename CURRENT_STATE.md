@@ -55,8 +55,8 @@ wykrytym zdarzeniu.
 
 ### Geometria i pomiar
 
-- Nagranie jest próbkowane raz na sekundę; pomijane są tylko nieanalizowane
-  klatki pośrednie.
+- Nagranie jest próbkowane raz na sekundę; po wykryciu pomijane są pomiary
+  do końca klipu: 5, 7 lub 10 s po wykryciu.
 - Na każdej próbce wyszukiwane są trzy krawędzie w skalibrowanych pasmach
   kadru POE_BRAMA: pionowa krawędź narożnika oraz lewa i prawa granica koloru
   ściany.
@@ -68,24 +68,33 @@ wykrytym zdarzeniu.
   ściany. Próbka jest odrzucana, jeśli przecięcia są odległe o ponad 20 px
   albo wynik jest poza dopuszczonym zakresem obrazu.
 - Pole testowe ma rozmiar 10×17 px i lewy górny róg `(X−12, Y−19)`.
-  Prostokąt odniesienia ma taki sam rozmiar, jest przesunięty o 2 px w lewo
-  i ma 5 pustych rzędów nad polem testowym.
+  Pomarańczowe pole odniesienia ma taki sam rozmiar, jest przesunięte o 2 px
+  w lewo i ma 5 pustych rzędów nad polem testowym. Drugie pole odniesienia
+  tego samego rozmiaru leży bezpośrednio nad pomarańczowym.
 - Jasność jest średnią pikseli po konwersji do skali szarości. Nie ma
-  rozmywania ani odejmowania tła.
+  rozmywania ani odejmowania tła. Do obliczeń używana jest większa średnia
+  jasność z dwóch pól odniesienia.
 - Sygnał to
-  `abs(test_mean - reference_mean) / reference_mean * 100`.
-  Domyślny próg wynosi 20%; wiewiórka nie jest klasyfikowana, a próg oznacza
+  `abs(test_mean - max(reference_1_mean, reference_2_mean)) /
+  max(reference_1_mean, reference_2_mean) * 100`.
+  Domyślny próg wynosi 22%; wiewiórka nie jest klasyfikowana, a próg oznacza
   wyłącznie zmianę jasności.
 
-Zdarzenie jest potwierdzone, gdy próg jest przekroczony w co najmniej 2 z
-4 kolejnych próbek. Detektor uzbraja się ponownie po 1,5 s bez sygnału.
-Domyślnie klip trwa 60 s i zaczyna się od pierwszej próbki spełniającej próg;
-nakładające się klipy nie są powielane. `--mode all` zapisuje wszystkie
-zdarzenia, a `--mode first` najwyżej pierwszy klip, lecz oba tryby analizują
-całe nagranie. Wideo klipu jest kodowane jako H.264, audio jako AAC.
+Do wykrycia wystarcza jedna próbka osiągająca lub przekraczająca próg;
+dokładnie 22% wyzwala próg domyślny. Detektor uzbraja się ponownie po 1,5 s
+bez sygnału. Długość klipu zależy od rzeczywiście zmierzonej różnicy:
+>=30% — 12 s, >=25% — 9 s, >=22% — 7 s. Klip zaczyna się 2 s przed wykryciem;
+następna próbka przypada na jego koniec, czyli 10, 7 lub 5 s po wykryciu.
+Jeśli wykrycie jest przed upływem 2 s nagrania, klip zaczyna się od pierwszej
+klatki. Wartości graniczne należą do odpowiadających im przedziałów. Nazwa
+zawiera zegarowy czas próbki wykrycia (zgodny z `czas_nagrania` w Excelu) oraz
+rzeczywistą różnicę jasności, zaokrągloną do 0,1 punktu procentowego.
+Nakładające się klipy nie są powielane.
+`--mode all` zapisuje wszystkie zdarzenia, a `--mode first` najwyżej pierwszy
+klip. Wideo klipu jest kodowane jako H.264, audio jako AAC.
 
-Każda próbka trafia do CSV kodowanego jako UTF-8 z BOM-em i rozdzielanego
-tabulatorami. Raport zawiera czas i indeks klatki, położenie krzyżyka i pól,
+Każda analizowana próbka trafia do skoroszytu Excel `.xlsx`, do arkusza
+`Pomiary`. Raport zawiera czas i indeks klatki, położenie krzyżyka i pól,
 średnie jasności, różnicę ze znakiem i bezwzględną, procent różnicy, stan
 progu, potwierdzenie zdarzenia i status geometrii. Błąd geometrii zapisuje się
 w kolumnie `status` i nie wyzwala sygnału.
@@ -95,8 +104,11 @@ w kolumnie `status` i nie wyzwala sygnału.
 Domyślne nagrania pochodzą z `/opt/cameras/recordings/POE_BRAMA`, a wyniki
 z `analysis/<data>/POE_BRAMA_wiewiorki/`. `--watch` sprawdza kolejkę co 30 s;
 segment jest zakończony, gdy pojawił się następny segment albo gdy bieżący
-plik nie zmieniał się przez 120 s. Stan kolejki zapisuje się w `analyzed.txt`.
-Usługa jest celowo niezależna od usługi kamery.
+plik nie zmieniał się przez 120 s. `--from-date RRRR-MM-DD` pozwala wznowić
+zaległości od wcześniejszej daty (bez opcji kolejka zaczyna od dziś). Stan
+kolejki zapisuje się w `analyzed.txt`. Jednostka systemd jest ustawiona, by
+przy restarcie nadrabiać od 2026-11-05. Usługa jest celowo niezależna od usługi
+kamery.
 
 Przykłady:
 

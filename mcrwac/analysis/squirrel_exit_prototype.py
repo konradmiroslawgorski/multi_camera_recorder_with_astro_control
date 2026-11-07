@@ -1,5 +1,4 @@
 import argparse
-import csv
 import math
 import os
 import re
@@ -7,7 +6,6 @@ import shutil
 import signal
 import subprocess
 import time as _time
-from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -15,11 +13,22 @@ from typing import Callable, Optional, Sequence
 
 import cv2
 import numpy as np
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
 
 @dataclass(frozen=True)
 class Appearance:
     start_frame: int
+    detection_percent: float
+
+    @property
+    def clip_seconds(self) -> float:
+        return _clip_duration_for_detection(self.detection_percent)
+
+    @property
+    def post_detection_seconds(self) -> float:
+        return self.clip_seconds - CLIP_PREROLL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -30,8 +39,15 @@ class BrightnessMeasurement:
     test_y: int
     reference_x: int
     reference_y: int
+    orange_reference_x: int
+    orange_reference_y: int
+    upper_reference_x: int
+    upper_reference_y: int
     test_mean: float
     reference_mean: float
+    orange_reference_mean: float
+    upper_reference_mean: float
+    reference_source: str
     signed_difference: float
     absolute_difference: float
     difference_percent: float
@@ -39,14 +55,12 @@ class BrightnessMeasurement:
 
 DEFAULT_ANALYSIS_OUTPUT_DIR = Path("/opt/cameras/recordings/analysis")
 ANALYSIS_SUBDIR = "POE_BRAMA_wiewiorki"
-DEFAULT_CLIP_SECONDS = 60.0
-DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT = 20.0
+DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT = 22.0
 BRIGHTNESS_SAMPLE_SECONDS = 1.0
+CLIP_PREROLL_SECONDS = 2.0
 BRIGHTNESS_MIN_EDGE_GRADIENT = 8.0
 BRIGHTNESS_MAX_LINE_RESIDUAL_PX = 3.0
 BRIGHTNESS_MIN_LINE_POINTS = 5
-CONFIRM_WINDOW_SAMPLES = 4
-CONFIRM_HITS = 2
 RELEASE_GAP_SECONDS = 1.5
 WATCH_POLL_SECONDS = 30.0
 WATCH_SETTLE_SECONDS = 120.0
@@ -56,6 +70,17 @@ DEFAULT_CAMERA = "POE_BRAMA"
 RECORDING_NAME_PATTERN = re.compile(r"^(\d{2})-(\d{2})-(\d{2})\.mkv$")
 
 
+def _clip_duration_for_detection(detection_percent: float) -> float:
+    for level, duration in (
+        (30.0, 12.0),
+        (25.0, 9.0),
+        (22.0, 7.0),
+    ):
+        if detection_percent >= level:
+            return duration
+    raise ValueError("Poziom wykrycia musi wynosić co najmniej 22%.")
+
+
 def _log(message: str, flush: bool = True) -> None:
     """Komunikat na ekran z czasem zegarowym [GG:MM:SS] (nie z nagrania)."""
     print(f"{datetime.now():[%H:%M:%S]} {message}", flush=flush)
@@ -63,35 +88,34 @@ def _log(message: str, flush: bool = True) -> None:
 
 class AppearanceDetector:
     def __init__(self, fps: float):
-        self._history: deque[tuple[int, bool]] = deque(maxlen=CONFIRM_WINDOW_SAMPLES)
         self._release_gap_frames = max(1, int(round(fps * RELEASE_GAP_SECONDS)))
         self._active = False
         self._last_seen_frame: Optional[int] = None
 
-    def update(self, frame_index: int, signal: bool) -> Optional[Appearance]:
+    def update(
+        self, frame_index: int, signal: bool, detection_percent: float
+    ) -> Optional[Appearance]:
         if self._active:
-            if signal:
-                self._last_seen_frame = frame_index
             if (
                 self._last_seen_frame is not None
-                and frame_index - self._last_seen_frame >= self._release_gap_frames
+                and frame_index - self._last_seen_frame < self._release_gap_frames
             ):
-                self._active = False
-                self._last_seen_frame = None
-                self._history.clear()
-            return None
+                if signal:
+                    self._last_seen_frame = frame_index
+                return None
 
-        self._history.append((frame_index, signal))
-        if len(self._history) < CONFIRM_WINDOW_SAMPLES:
-            return None
+            self._active = False
+            self._last_seen_frame = None
 
-        positive_frames = [index for index, detected in self._history if detected]
-        if len(positive_frames) < CONFIRM_HITS:
+        if not signal:
             return None
 
         self._active = True
-        self._last_seen_frame = positive_frames[-1]
-        return Appearance(start_frame=positive_frames[0])
+        self._last_seen_frame = frame_index
+        return Appearance(
+            start_frame=frame_index,
+            detection_percent=detection_percent,
+        )
 
 
 def _recording_start_time(video_path: Path, video_duration: float) -> datetime:
@@ -130,7 +154,7 @@ def _reserve_output_path(output_path: Path) -> Path:
         candidate = output_path.with_name(
             f"{output_path.stem}{suffix}{output_path.suffix}"
         )
-        if candidate.with_suffix(".csv").exists():
+        if candidate.exists():
             index += 1
             continue
         try:
@@ -148,7 +172,6 @@ def _save_appearance_clips(
     appearances: list[Appearance],
     fps: float,
     frame_count: int,
-    clip_seconds: float,
     recording_start: datetime,
 ) -> list[Path]:
     if not appearances:
@@ -161,15 +184,22 @@ def _save_appearance_clips(
     video_duration = frame_count / fps
     clip_paths: list[Path] = []
 
-    for appearance in appearances:
-        start_seconds = appearance.start_frame / fps
-        duration = min(clip_seconds, video_duration - start_seconds)
+    for clip_index, appearance in enumerate(appearances, start=1):
+        detection_seconds = appearance.start_frame / fps
+        start_seconds = max(0.0, detection_seconds - CLIP_PREROLL_SECONDS)
+        end_seconds = min(
+            detection_seconds + appearance.post_detection_seconds,
+            video_duration,
+        )
+        duration = end_seconds - start_seconds
         if duration <= 0:
             continue
 
-        clip_start = recording_start + timedelta(seconds=start_seconds)
+        detection_time = recording_start + timedelta(seconds=detection_seconds)
+        time_label = detection_time.strftime("%H_%M_%S")
+        detection_label = f"{appearance.detection_percent:.1f}".replace(".", "_")
         clip_path = clips_dir / (
-            f"{video_path.stem}_{clip_start.strftime('%Y%m%d%H%M%S')}.mkv"
+            f"{video_path.stem}_{time_label}_{detection_label}pct.mkv"
         )
         suffix = 1
         while True:
@@ -180,7 +210,7 @@ def _save_appearance_clips(
             except FileExistsError:
                 suffix += 1
                 clip_path = clips_dir / (
-                    f"{video_path.stem}_{clip_start.strftime('%Y%m%d%H%M%S')}"
+                    f"{video_path.stem}_{time_label}_{detection_label}pct"
                     f"_{suffix:02d}.mkv"
                 )
         command = [
@@ -188,10 +218,10 @@ def _save_appearance_clips(
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            str(video_path),
             "-ss",
             f"{start_seconds:.6f}",
+            "-i",
+            str(video_path),
             "-t",
             f"{duration:.6f}",
             "-map",
@@ -201,7 +231,7 @@ def _save_appearance_clips(
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            "ultrafast",
             "-crf",
             "20",
             "-c:a",
@@ -209,7 +239,18 @@ def _save_appearance_clips(
             "-y",
             str(clip_path),
         ]
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        _log(f"Rozpoczynam zapis klipu {clip_index}/{len(appearances)}: {clip_path.name}")
+        clip_started = _time.perf_counter()
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+        finally:
+            elapsed = _time.perf_counter() - clip_started
+            _log(
+                f"Czas zapisu klipu {clip_index}/{len(appearances)}: "
+                f"{elapsed:.2f} s ({clip_path.name})"
+            )
         if result.returncode != 0:
             clip_path.unlink(missing_ok=True)
             raise RuntimeError(
@@ -292,7 +333,7 @@ def _wall_intersection(
 def _measure_opening_brightness(
     frame: np.ndarray, offset_x: int = 0, offset_y: int = 0
 ) -> BrightnessMeasurement:
-    """Measure grayscale in the test/reference boxes located by wall lines."""
+    """Measure grayscale in the test box and use the brighter of two references."""
     height, width = frame.shape[:2]
     if height <= 0 or width <= 0:
         raise ValueError("pusta klatka")
@@ -393,26 +434,49 @@ def _measure_opening_brightness(
     test_y_end = round(cross_y - 2)
     if test_x_end - test_x != 10 or test_y_end - test_y != 17:
         raise ValueError("nieprawidłowy rozmiar pola testowego")
-    reference_x = test_x - 2
+    orange_reference_x = test_x - 2
     reference_y_end = test_y - 5
-    reference_y = reference_y_end - 17
+    orange_reference_y = reference_y_end - 17
+    upper_reference_x = orange_reference_x
+    upper_reference_y = orange_reference_y - 17
     if (
-        reference_x < 0
-        or reference_y < 0
+        orange_reference_x < 0
+        or orange_reference_y < 0
+        or upper_reference_y < 0
         or test_x < 0
         or test_y < 0
         or test_x_end > width
         or test_y_end > height
-        or reference_x + 10 > width
+        or orange_reference_x + 10 > width
         or reference_y_end > height
+        or upper_reference_y + 17 > height
     ):
         raise ValueError("pole jasności wychodzi poza klatkę")
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     test_mean = float(gray[test_y:test_y_end, test_x:test_x_end].mean())
-    reference_mean = float(
-        gray[reference_y:reference_y_end, reference_x : reference_x + 10].mean()
+    orange_reference_mean = float(
+        gray[
+            orange_reference_y:reference_y_end,
+            orange_reference_x : orange_reference_x + 10,
+        ].mean()
     )
+    upper_reference_mean = float(
+        gray[
+            upper_reference_y : upper_reference_y + 17,
+            upper_reference_x : upper_reference_x + 10,
+        ].mean()
+    )
+    if orange_reference_mean >= upper_reference_mean:
+        reference_x = orange_reference_x
+        reference_y = orange_reference_y
+        reference_mean = orange_reference_mean
+        reference_source = "lower"
+    else:
+        reference_x = upper_reference_x
+        reference_y = upper_reference_y
+        reference_mean = upper_reference_mean
+        reference_source = "upper"
     if reference_mean <= 0:
         raise ValueError("jasność pola odniesienia wynosi zero")
     signed_difference = test_mean - reference_mean
@@ -424,8 +488,15 @@ def _measure_opening_brightness(
         test_y=test_y,
         reference_x=reference_x,
         reference_y=reference_y,
+        orange_reference_x=orange_reference_x,
+        orange_reference_y=orange_reference_y,
+        upper_reference_x=upper_reference_x,
+        upper_reference_y=upper_reference_y,
         test_mean=test_mean,
         reference_mean=reference_mean,
+        orange_reference_mean=orange_reference_mean,
+        upper_reference_mean=upper_reference_mean,
+        reference_source=reference_source,
         signed_difference=signed_difference,
         absolute_difference=absolute_difference,
         difference_percent=absolute_difference / reference_mean * 100.0,
@@ -434,18 +505,18 @@ def _measure_opening_brightness(
 
 def _analyze_brightness_video(
     video_path: Path,
-    csv_path: Path,
+    xlsx_path: Path,
     fps: float,
     frame_count: int,
     recording_start: datetime,
     threshold_percent: float,
-    clip_seconds: float,
     offset_x: int = 0,
     offset_y: int = 0,
     mode: str = "all",
 ) -> tuple[list[Appearance], int, int]:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
+        xlsx_path.unlink(missing_ok=True)
         raise RuntimeError(f"Nie można otworzyć pliku do pomiaru jasności: {video_path}")
 
     sample_step_frames = max(1, int(round(fps * BRIGHTNESS_SAMPLE_SECONDS)))
@@ -454,7 +525,6 @@ def _analyze_brightness_video(
     valid_rows = 0
     invalid_rows = 0
     threshold_hits = 0
-    minimum_clip_gap = int(round(fps * clip_seconds))
     headers = [
         "czas_nagrania",
         "czas_s",
@@ -474,121 +544,180 @@ def _analyze_brightness_video(
         "zdarzenie_potwierdzone",
         "poczatek_klipu",
         "status",
+        "odniesienie_pomaranczowe_x_lewy_px",
+        "odniesienie_pomaranczowe_y_gorny_px",
+        "jasnosc_odniesienia_pomaranczowego_srednia_0_255",
+        "odniesienie_gorne_x_lewy_px",
+        "odniesienie_gorne_y_gorny_px",
+        "jasnosc_odniesienia_gornego_srednia_0_255",
+        "odniesienie_uzyte",
     ]
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Pomiary"
+    worksheet.freeze_panes = "A2"
+    worksheet.append(headers)
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True)
+    worksheet.column_dimensions["A"].width = 22
+    worksheet.column_dimensions["B"].width = 12
+    worksheet.column_dimensions["R"].width = 32
+    worksheet.column_dimensions["S"].width = 27
+    worksheet.column_dimensions["T"].width = 29
+    worksheet.column_dimensions["U"].width = 44
+    worksheet.column_dimensions["V"].width = 22
+    worksheet.column_dimensions["W"].width = 24
+    worksheet.column_dimensions["X"].width = 39
+    worksheet.column_dimensions["Y"].width = 18
 
     try:
-        with csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
-            rows = csv.writer(csv_file, delimiter="\t")
-            rows.writerow(headers)
-            frame_index = 0
-            while frame_index < frame_count:
-                ok, frame = capture.read()
-                if not ok:
-                    raise RuntimeError(
-                        f"Nie można odczytać klatki {frame_index} z {video_path}"
-                    )
+        frame_index = 0
+        while frame_index < frame_count:
+            ok, frame = capture.read()
+            if not ok:
+                raise RuntimeError(
+                    f"Nie można odczytać klatki {frame_index} z {video_path}"
+                )
 
-                timestamp = recording_start + timedelta(seconds=frame_index / fps)
-                row: list[object] = [
-                    timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                    f"{frame_index / fps:.3f}",
+            timestamp = recording_start + timedelta(seconds=frame_index / fps)
+            row: list[object] = [
+                timestamp,
+                frame_index / fps,
+                frame_index,
+            ]
+            threshold_hit = False
+            try:
+                measurement = _measure_opening_brightness(
+                    frame, offset_x, offset_y
+                )
+            except ValueError as error:
+                invalid_rows += 1
+                appearance = detector.update(frame_index, False, 0.0)
+                accepted_event = False
+                if appearance is not None and (
+                    (mode == "all" or not appearances)
+                    and (
+                        not appearances
+                        or appearance.start_frame - appearances[-1].start_frame
+                        >= int(round(fps * appearances[-1].post_detection_seconds))
+                    )
+                ):
+                    appearances.append(appearance)
+                    accepted_event = True
+                row.extend([None] * 11)
+                row.extend(
+                    [
+                        0,
+                        int(appearance is not None),
+                        int(accepted_event),
+                        f"blad_geometrii: {error}",
+                    ]
+                )
+                row.extend([None] * 7)
+            else:
+                valid_rows += 1
+                threshold_hit = measurement.difference_percent >= threshold_percent
+                threshold_hits += int(threshold_hit)
+                appearance = detector.update(
                     frame_index,
-                ]
-                threshold_hit = False
-                try:
-                    measurement = _measure_opening_brightness(
-                        frame, offset_x, offset_y
+                    threshold_hit,
+                    measurement.difference_percent,
+                )
+                accepted_event = False
+                if appearance is not None and (
+                    (mode == "all" or not appearances)
+                    and (
+                        not appearances
+                        or appearance.start_frame - appearances[-1].start_frame
+                        >= int(round(fps * appearances[-1].post_detection_seconds))
                     )
-                except ValueError as error:
-                    invalid_rows += 1
-                    appearance = detector.update(frame_index, False)
-                    accepted_event = False
-                    if appearance is not None and (
-                        (mode == "all" or not appearances)
-                        and (
-                            not appearances
-                            or appearance.start_frame - appearances[-1].start_frame
-                            >= minimum_clip_gap
-                        )
-                    ):
-                        appearances.append(appearance)
-                        accepted_event = True
-                    row.extend([""] * 11)
-                    row.extend(
-                        [
-                            "0",
-                            "1" if appearance is not None else "0",
-                            "1" if accepted_event else "0",
-                            f"blad_geometrii: {error}",
-                        ]
-                    )
-                else:
-                    valid_rows += 1
-                    threshold_hit = (
-                        measurement.difference_percent >= threshold_percent
-                    )
-                    threshold_hits += int(threshold_hit)
-                    appearance = detector.update(frame_index, threshold_hit)
-                    accepted_event = False
-                    if appearance is not None and (
-                        (mode == "all" or not appearances)
-                        and (
-                            not appearances
-                            or appearance.start_frame - appearances[-1].start_frame
-                            >= minimum_clip_gap
-                        )
-                    ):
-                        appearances.append(appearance)
-                        accepted_event = True
-                    row.extend(
-                        [
-                            f"{measurement.cross_x:.3f}",
-                            f"{measurement.cross_y:.3f}",
-                            measurement.test_x,
-                            measurement.test_y,
-                            measurement.reference_x,
-                            measurement.reference_y,
-                            f"{measurement.test_mean:.4f}",
-                            f"{measurement.reference_mean:.4f}",
-                            f"{measurement.signed_difference:.4f}",
-                            f"{measurement.absolute_difference:.4f}",
-                            f"{measurement.difference_percent:.4f}",
-                            "1" if threshold_hit else "0",
-                            "1" if appearance is not None else "0",
-                            "1" if accepted_event else "0",
-                            "ok",
-                        ]
-                    )
-                rows.writerow(row)
+                ):
+                    appearances.append(appearance)
+                    accepted_event = True
+                row.extend(
+                    [
+                        round(measurement.cross_x, 3),
+                        round(measurement.cross_y, 3),
+                        measurement.test_x,
+                        measurement.test_y,
+                        measurement.reference_x,
+                        measurement.reference_y,
+                        round(measurement.test_mean, 4),
+                        round(measurement.reference_mean, 4),
+                        round(measurement.signed_difference, 4),
+                        round(measurement.absolute_difference, 4),
+                        round(measurement.difference_percent, 4),
+                        int(threshold_hit),
+                        int(appearance is not None),
+                        int(accepted_event),
+                        "ok",
+                    ]
+                )
+                row.extend(
+                    [
+                        measurement.orange_reference_x,
+                        measurement.orange_reference_y,
+                        round(measurement.orange_reference_mean, 4),
+                        measurement.upper_reference_x,
+                        measurement.upper_reference_y,
+                        round(measurement.upper_reference_mean, 4),
+                        (
+                            "pomaranczowe"
+                            if measurement.reference_source == "lower"
+                            else "gorne"
+                        ),
+                    ]
+                )
+            worksheet.append(row)
 
-                frame_index += 1
-                for _ in range(sample_step_frames - 1):
-                    if frame_index >= frame_count:
+            sample_advance_frames = sample_step_frames
+            if appearance is not None:
+                sample_advance_frames = max(
+                    sample_step_frames,
+                    int(round(fps * appearance.post_detection_seconds)),
+                )
+            frame_index += 1
+            frames_to_skip = min(
+                sample_advance_frames - 1,
+                frame_count - frame_index,
+            )
+            for _ in range(frames_to_skip):
+                if frame_index >= frame_count:
+                    break
+                if not capture.grab():
+                    if frame_index >= frame_count - sample_step_frames:
+                        frame_index = frame_count
                         break
-                    if not capture.grab():
-                        if frame_index >= frame_count - sample_step_frames:
-                            frame_index = frame_count
-                            break
-                        raise RuntimeError(
-                            f"Nie można odczytać klatek przed indeksem {frame_index} "
-                            f"z {video_path}"
-                        )
-                    frame_index += 1
+                    raise RuntimeError(
+                        f"Nie można odczytać klatek przed indeksem {frame_index} "
+                        f"z {video_path}"
+                    )
+                frame_index += 1
+        if valid_rows == 0:
+            raise RuntimeError(
+                f"Nie udało się zmierzyć pola jasności w żadnej klatce: {video_path}"
+            )
+        for row in worksheet.iter_rows(min_row=2):
+            row[1].number_format = "0.000"
+            for cell in row[3:5]:
+                cell.number_format = "0.000"
+            for cell in row[9:14]:
+                cell.number_format = "0.0000"
+            for cell in (row[20], row[23]):
+                cell.number_format = "0.0000"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        workbook.save(xlsx_path)
     except (KeyboardInterrupt, SystemExit):
-        csv_path.unlink(missing_ok=True)
+        xlsx_path.unlink(missing_ok=True)
         raise
     except Exception:
-        csv_path.unlink(missing_ok=True)
+        xlsx_path.unlink(missing_ok=True)
         raise
     finally:
         capture.release()
 
-    if valid_rows == 0:
-        raise RuntimeError(
-            f"Nie udało się zmierzyć pola jasności w żadnej klatce: {video_path}"
-        )
     _log(
-        f"Jasność test/odniesienie: {csv_path}; próbki {valid_rows}, "
+        f"Jasność test/odniesienie: {xlsx_path}; próbki {valid_rows}, "
         f"błędy geometrii {invalid_rows}, sygnały >= {threshold_percent:.1f}%: "
         f"{threshold_hits}, potwierdzone klipy: {len(appearances)}."
     )
@@ -599,7 +728,6 @@ def _analyze_brightness_only(
     video_path: Path,
     output_path: Optional[Path],
     mode: str,
-    clip_seconds: float,
     threshold_percent: float,
 ) -> Path:
     capture = cv2.VideoCapture(str(video_path))
@@ -616,19 +744,18 @@ def _analyze_brightness_only(
     recording_start = _recording_start_time(video_path, frame_count / fps)
     output_path = _timestamped_output_path(video_path, output_path, recording_start)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    brightness_csv_path = _reserve_output_path(
+    brightness_xlsx_path = _reserve_output_path(
         output_path.with_name(
-            f"{video_path.stem}_brightness_{recording_start:%Y%m%d%H%M%S}.csv"
+            f"{video_path.stem}_brightness_{recording_start:%Y%m%d%H%M%S}.xlsx"
         )
     )
     appearances, _, _ = _analyze_brightness_video(
         video_path,
-        brightness_csv_path,
+        brightness_xlsx_path,
         fps,
         frame_count,
         recording_start,
         threshold_percent,
-        clip_seconds,
         mode=mode,
     )
     clip_paths = _save_appearance_clips(
@@ -637,10 +764,9 @@ def _analyze_brightness_only(
         appearances,
         fps,
         frame_count,
-        clip_seconds,
         recording_start,
     )
-    _log(f"Wyniki jasności: {brightness_csv_path}")
+    _log(f"Wyniki jasności: {brightness_xlsx_path}")
     if clip_paths:
         _log("Zapisane klipy z progu jasności:")
         for clip_path in clip_paths:
@@ -654,23 +780,21 @@ def analyze_video(
     video_path: Path,
     output_path: Optional[Path] = None,
     mode: str = "all",
-    clip_seconds: float = DEFAULT_CLIP_SECONDS,
     brightness_threshold_percent: float = DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT,
 ) -> Path:
     if mode not in {"first", "all"}:
         raise ValueError("Tryb musi mieć wartość 'first' albo 'all'.")
-    if not math.isfinite(clip_seconds) or clip_seconds <= 0:
-        raise ValueError("Długość klipu musi być dodatnią, skończoną wartością.")
     if (
         not math.isfinite(brightness_threshold_percent)
-        or brightness_threshold_percent < 0
+        or brightness_threshold_percent < DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT
     ):
-        raise ValueError("Próg jasności musi być nieujemną, skończoną wartością.")
+        raise ValueError(
+            "Próg jasności musi być skończoną wartością co najmniej 22%."
+        )
     return _analyze_brightness_only(
         video_path,
         output_path,
         mode,
-        clip_seconds,
         brightness_threshold_percent,
     )
 
@@ -952,7 +1076,13 @@ def main() -> None:
         "--watch",
         action="store_true",
         help="Tryb ciągły: analizuj każde nagranie zaraz po jego zakończeniu "
-        "(dziś i kolejne dni), także zaległe; kończy się sygnałem SIGTERM/Ctrl+C",
+        "(od --from-date lub dziś), także zaległe; kończy się sygnałem "
+        "SIGTERM/Ctrl+C",
+    )
+    parser.add_argument(
+        "--from-date",
+        help="Z --watch: data RRRR-MM-DD, od której nadrabiać zaległe nagrania "
+        "(domyślnie dziś)",
     )
     parser.add_argument(
         "--poll-seconds",
@@ -999,18 +1129,12 @@ def main() -> None:
         "first: zapisz najwyżej pierwszy klip; oba tryby analizują cały film",
     )
     parser.add_argument(
-        "--clip-seconds",
-        type=float,
-        default=DEFAULT_CLIP_SECONDS,
-        help="Długość klipu od wykrytego początku w sekundach "
-        f"(domyślnie {DEFAULT_CLIP_SECONDS:g})",
-    )
-    parser.add_argument(
         "--brightness-threshold-percent",
         type=float,
         default=DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT,
         help="Próg bezwzględnej różnicy jasności test–odniesienie w procentach "
-        f"(domyślnie {DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT:g})",
+        f"(co najmniej {DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT:g}; domyślnie "
+        f"{DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT:g})",
     )
     args = parser.parse_args()
 
@@ -1019,6 +1143,8 @@ def main() -> None:
             parser.error("--watch nie łączy się z plikiem ani z --date.")
     elif (args.video is None) == (args.date is None):
         parser.error("Podaj plik wideo, --date albo --watch.")
+    if args.from_date is not None and not args.watch:
+        parser.error("--from-date wymaga --watch.")
     if args.hours and args.date is None and not args.watch:
         parser.error("--hours wymaga --date lub --watch.")
     if args.hours and len(args.hours) > 2:
@@ -1027,6 +1153,11 @@ def main() -> None:
     try:
         if args.date is not None:
             datetime.strptime(args.date, "%Y-%m-%d")
+        first_date = (
+            datetime.strptime(args.from_date, "%Y-%m-%d").date()
+            if args.from_date is not None
+            else None
+        )
         hours = [_parse_clock(value) for value in args.hours or []]
     except ValueError as error:
         parser.error(str(error))
@@ -1050,7 +1181,6 @@ def main() -> None:
                 video,
                 args.output,
                 mode=args.mode,
-                clip_seconds=args.clip_seconds,
                 brightness_threshold_percent=args.brightness_threshold_percent,
             )
 
@@ -1066,6 +1196,7 @@ def main() -> None:
                 start,
                 end,
                 poll_seconds=args.poll_seconds,
+                first_date=first_date,
             )
         except KeyboardInterrupt:
             _log("Przerwano.")
@@ -1104,7 +1235,6 @@ def main() -> None:
                 video,
                 args.output,
                 mode=args.mode,
-                clip_seconds=args.clip_seconds,
                 brightness_threshold_percent=args.brightness_threshold_percent,
             )
             if args.output is None and RECORDING_NAME_PATTERN.match(video.name):

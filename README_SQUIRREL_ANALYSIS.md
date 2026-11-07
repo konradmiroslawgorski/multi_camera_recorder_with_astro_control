@@ -4,8 +4,9 @@ Część techniczna: [README_SQUIRREL_ANALYSIS_TECH.md](README_SQUIRREL_ANALYSIS
 
 Analizator w `mcrwac/analysis/squirrel_exit_prototype.py` przetwarza nagrania
 kamery `POE_BRAMA` offline. Nie wysyła alarmów i nie jest podłączony do usług
-nagrywających. Klipy wyzwala wyłącznie różnica jasności między dwoma małymi
-polami przy otworze. Nie ma detekcji ruchu ani wyszukiwania komina lub dachu.
+nagrywających. Klipy wyzwala wyłącznie różnica jasności jednego małego pola
+testowego i jaśniejszego z dwóch pól odniesienia przy otworze. Nie ma detekcji
+ruchu ani wyszukiwania komina lub dachu.
 
 ### Algorytm krok po kroku
 
@@ -16,19 +17,37 @@ polami przy otworze. Nie ma detekcji ruchu ani wyszukiwania komina lub dachu.
    3 px. Środek krzyżyka to średnia przecięć linii pionowej z obiema liniami
    poziomymi; gdy przecięcia są odległe o ponad 20 px, pomiar jest odrzucany.
 2. **Pola pomiarowe.** Pole testowe ma 10×17 px, z lewym górnym rogiem
-   `(X−12, Y−19)` względem krzyżyka. Pole odniesienia ma ten sam rozmiar,
-   jest 2 px w lewo i 5 pustych pikseli nad polem testowym. Oba pola są
-   mierzone w skali szarości, bez rozmycia i odejmowania tła.
-3. **Sygnał i klip.** Sygnał przekracza próg, gdy
-   `abs(jasność_testu - jasność_odniesienia) / jasność_odniesienia * 100 >= 20%`.
-   Klip powstaje po potwierdzeniu sygnału w co najmniej 2 z 4 kolejnych próbek;
-   jego początek przypada na pierwszą próbkę spełniającą próg. Nakładające się
-   60-sekundowe klipy nie są powielane. `all` zapisuje wszystkie zdarzenia,
-   `first` najwyżej pierwszy klip; oba tryby tworzą pomiar całego nagrania.
+   `(X−12, Y−19)` względem krzyżyka. Pomarańczowe pole odniesienia ma ten sam
+   rozmiar, jest 2 px w lewo i 5 pustych pikseli nad polem testowym. Drugie
+   pole odniesienia o tym samym rozmiarze leży bezpośrednio nad pomarańczowym,
+   z wyrównanym lewym brzegiem. Wszystkie trzy pola są mierzone w skali
+   szarości, bez rozmycia; do obliczeń wybierana jest większa średnia z dwóch
+   pól odniesienia.
+3. **Sygnał i klip.** Niech `odniesienie = max(odniesienie_pomarańczowe,
+   odniesienie_górne)`. Sygnał występuje, gdy
+   `abs(jasność_testu - odniesienie) / odniesienie * 100` jest równe progowi
+   lub większe. Jedna próbka wystarcza do wykrycia. Długość
+   klipu i przerwa w próbkowaniu zależą od zmierzonej różnicy:
+
+   | Różnica | Długość całego klipu | Następna próbka |
+   |---------|---------------------|-----------------|
+   | >=30% | 12 s | 10 s po wykryciu |
+   | >=25% | 9 s | 7 s po wykryciu |
+   | >=22% | 7 s | 5 s po wykryciu |
+
+   Granice są włączne: dokładnie 30% daje klip 12 s, dokładnie 25% — 9 s,
+   a dokładnie 22% — 7 s. Klip zaczyna się 2 s przed wykryciem i kończy wraz
+   z następną próbką. Po wykryciu analizator pomija próbki do końca klipu,
+   a potem wraca do próbkowania co sekundę. Jeśli zdarzenie wypada na początku
+   filmu, dostępny przedział przed wykryciem jest krótszy.
+   Nazwa klipu zawiera rzeczywistą różnicę z próbki wykrycia, zaokrągloną do
+   0,1 punktu procentowego. `all` zapisuje wszystkie niepokrywające się klipy,
+   `first` najwyżej pierwszy; oba tryby analizują całe nagranie poza przerwami
+   po wykryciu.
 Pomiar linii jest skalibrowany dla widoku `POE_BRAMA` i szuka krawędzi w
 ograniczonych pasach obrazu. Po większym przesunięciu kamery może nie znaleźć
-poprawnej geometrii; błąd będzie widoczny w kolumnie `status` CSV. Przekroczenie
-progu oznacza zmianę jasności, a nie pewne rozpoznanie wiewiórki: wpływać mogą
+poprawnej geometrii; błąd będzie widoczny w kolumnie `status` arkusza Excel.
+Przekroczenie progu oznacza zmianę jasności, a nie pewne rozpoznanie wiewiórki: wpływać mogą
 też słońce, cień, przesunięcie kamery lub obiekt w polu odniesienia. Każda
 sekundowa próbka jest oceniana; nie ma globalnego uśredniania tła ani odrzucania
 próbek po skoku jasności kamery.
@@ -50,12 +69,12 @@ Przykład dla nagrania z serwera:
 Domyślnie analiza przetwarza cały film i zapisuje wszystkie wykryte pojawienia
 się (`--mode all`). Aby zapisać tylko pierwszy klip, użyj `--mode first`.
 Jasnościowy próg można dostroić opcją `--brightness-threshold-percent`
-(domyślnie 20), a długość klipu opcją `--clip-seconds`, na przykład:
+(domyślnie 22; dozwolone wartości to 22 lub więcej), na przykład:
 
 ```bash
 ./venv_motion/bin/python -m mcrwac.analysis.squirrel_exit_prototype \
   /ścieżka/do/nagrania.mkv --mode all \
-  --brightness-threshold-percent 20 --clip-seconds 120
+  --brightness-threshold-percent 22
 ```
 
 Aby przeanalizować wiele nagrań z jednego dnia, użyj `--date` (zamiast pliku) i
@@ -79,8 +98,10 @@ zakończeniu**, jedno po drugim (kolejka od najstarszego). Plik jest uznany za
 zakończony, gdy w katalogu dnia jest już nowszy segment albo gdy nie był
 zapisywany od 2 minut — dlatego ostatni plik dnia (po wyłączeniu nagrywania
 przez astro wieczorem) też zostanie przeanalizowany, bez osobnego wyzwalacza.
-Zaległości (np. po restarcie) są nadrabiane; dni liczą się od uruchomienia, więc
-analiza przechodzi przez północ. `--hours` ogranicza zakres godzin każdego dnia.
+Zaległości (np. po restarcie) są nadrabiane; Dni liczą się od uruchomienia, więc analiza przechodzi przez północ.
+`--from-date RRRR-MM-DD` pozwala wznowić zaległości od wcześniejszej daty;
+bez niego kolejka zaczyna od dziś. `--hours` ogranicza zakres godzin każdego
+dnia.
 Proces ma obniżony priorytet (`--nice`, domyślnie 10), by nie dławić
 rejestratora.
 
@@ -91,6 +112,13 @@ wiersz. Plik z błędem trafia do listy jako `blad` i nie jest ponawiany.
 
 ```bash
 ./venv_motion/bin/python -m mcrwac.analysis.squirrel_exit_prototype --watch
+```
+
+Przykład wznowienia zaległości od 5 listopada 2026:
+
+```bash
+./venv_motion/bin/python -m mcrwac.analysis.squirrel_exit_prototype \
+  --watch --from-date 2026-11-05
 ```
 
 Jako usługa (jak rejestrator, jednorazowa instalacja na serwerze):
@@ -106,21 +134,23 @@ journalctl -u squirrel-analysis -f
 
 Wszystko trafia domyślnie do podkatalogu z datą nagrania,
 `/opt/cameras/recordings/analysis/RRRR-MM-DD/POE_BRAMA_wiewiorki/` (np. `analysis/2026-10-26/`;
-tworzony automatycznie), a nazwy mają postać
-`<nazwa nagrania>_<...>_RRRRMMDDGGMMSS`:
+tworzony automatycznie). Nazwa skoroszytu zawiera datę i godzinę startu
+nagrania; nazwa klipu zawiera zegarowy czas próbki wykrycia i zmierzoną
+różnicę:
 
 | Plik | Nazwa | Zawartość |
 |------|-------|-----------|
-| CSV jasności (zawsze) | `<nagranie>_brightness_<czas startu nagrania>.csv` | tabulatorowy; jeden wiersz na sekundę: krzyżyk, współrzędne obu pól, średnie jasności, różnica ze znakiem i bezwzględna, różnica procentowa, sygnał ≥ progu i zdarzenie potwierdzone |
-| Klip | `<nagranie>_<czas zdarzenia>.mkv` | fragment źródła od pierwszej próbki spełniającej próg (domyślnie 60 s), wideo H.264, dźwięk AAC |
+| Excel jasności (zawsze) | `<nagranie>_brightness_<czas startu nagrania>.xlsx` | skoroszyt z arkuszem `Pomiary`; jeden wiersz na analizowaną próbkę (zwykle co sekundę, z przerwą 5/7/10 s po wykryciu do końca klipu): krzyżyk, współrzędne trzech pól, jasności obu odniesień i wybrane odniesienie; nagłówek jest zamrożony, a tabela ma filtr |
+| Klip | `<nagranie>_<czas_zegarowy_HH_MM_SS>_<zmierzona_różnica>pct.mkv` | fragment 7–12 s, zaczyna się 2 s przed próbką wykrycia i kończy przy następnej próbce; długość zależy od zmierzonej różnicy; wideo H.264 (`ultrafast`, CRF 20), dźwięk AAC; log podaje czas zapisu każdego klipu |
 
-Czas w nazwie (`RRRRMMDDGGMMSS`, np. `20261026133021`) liczony jest z katalogu
-daty i godziny w nazwie pliku (`2026-10-26/13-00-08.mkv`); dla klipu dodatkowo
-o przesunięcie zdarzenia w filmie. Przykład: zdarzenie 30 s po starcie
-`13-00-08.mkv` daje `13-00-08_20261026130038.mkv`. Gdy nazwy nie da się
-odczytać, czas startu wynika z daty modyfikacji pliku. Ponowne analizy nie
+Nazwa klipu zawiera zegarowy czas próbki wykrycia (zgodny z `czas_nagrania` w
+Excelu), nie wcześniejszego początku fragmentu, oraz rzeczywistą różnicę
+jasności z tej próbki. Przykład: próbka o 06:24:34 z różnicą 22,7% daje
+`06-10-39_06_24_34_22_7pct.mkv`; fragment zaczyna się o 06:24:32. Czas jest
+obcinany do pełnych sekund, a procent zaokrąglany do jednego miejsca.
+Skoroszyt zachowuje datę i godzinę nagrania w nazwie. Ponowne analizy nie
 nadpisują wyników — dostają sufiks, np. `_02`. Opcja `--output` wskazuje inną
-bazową ścieżkę; CSV i klipy trafiają do jej katalogu.
+bazową ścieżkę; skoroszyt Excel i klipy trafiają do jej katalogu.
 
 W trybie `--watch` (usługa) po każdym przeanalizowanym nagraniu program skleja klipy dnia
 (`*.mkv` w kolejności czasu) w `result_RRRR_MM_DD.mkv` w tym samym katalogu
