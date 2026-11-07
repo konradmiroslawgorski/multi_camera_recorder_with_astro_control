@@ -10,35 +10,11 @@ import time as _time
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import cv2
 import numpy as np
-
-
-@dataclass(frozen=True)
-class OpeningCandidate:
-    x: float
-    y: float
-    score: float
-
-
-@dataclass(frozen=True)
-class TrackResult:
-    x: int
-    y: int
-    confidence: float
-
-
-@dataclass(frozen=True)
-class ActivityRegion:
-    x: int
-    y: int
-    width: int
-    height: int
-    diagonal: float
 
 
 @dataclass(frozen=True)
@@ -47,482 +23,54 @@ class Appearance:
 
 
 @dataclass(frozen=True)
-class AnchorSpec:
-    file_name: str
-    crop_origin: tuple[int, int]
-    anchor: tuple[float, float]
+class BrightnessMeasurement:
+    cross_x: float
+    cross_y: float
+    test_x: int
+    test_y: int
+    reference_x: int
+    reference_y: int
+    test_mean: float
+    reference_mean: float
+    signed_difference: float
+    absolute_difference: float
+    difference_percent: float
 
 
-REFERENCE_DIR = Path(__file__).parent / "reference"
-# Dwa punkty, które zawsze są widoczne na tle nieba (cień na ścianie ich nie
-# dotyczy): lewa krawędź komina i szczyt dachu. Współrzędne w pełnej klatce
-# wzorcowej (`11-52-43.mkv`, klatka 0), tak samo jak położenie otworu.
-CHIMNEY_ANCHOR = AnchorSpec("poe_brama_chimney.png", (150, 485), (183.0, 526.0))
-RIDGE_ANCHOR = AnchorSpec("poe_brama_ridge.png", (610, 515), (666.0, 555.0))
-REFERENCE_OPENING = (347.0, 744.0)
-ANCHOR_SCALES = tuple(np.arange(0.85, 1.19, 0.03))
-ANCHOR_MIN_SCORE = 0.58
-ANCHOR_HINT_MIN_SCORE = 0.50
-TRIANGLE_MIN_SCALE = 0.85
-TRIANGLE_MAX_SCALE = 1.18
-TRIANGLE_MAX_ANGLE_DEG = 15.0
-REFERENCE_MAX_SPREAD_PX = 12.0
-SAMPLE_SECONDS = 3.0
-SAMPLE_INTERVAL_SECONDS = 0.25
-MIN_TRACK_CONFIDENCE = 0.60
-TEMPLATE_RADIUS = 48
-SEARCH_RADIUS = 32
-BACKGROUND_ALPHA = 0.01
-MIN_DARKENING_RATIO = 0.65
-BACKGROUND_FREEZE_SECONDS = 30.0
-ROI_HALF_WIDTH = 16
-ROI_TOP = 24
-ROI_BOTTOM = 24
-DEFAULT_MIN_DIAGONAL_PX = 14.0
-MIN_REGION_SIDE_PX = 5
-MAX_REGION_ASPECT = 6.0
 DEFAULT_ANALYSIS_OUTPUT_DIR = Path("/opt/cameras/recordings/analysis")
 ANALYSIS_SUBDIR = "POE_BRAMA_wiewiorki"
 DEFAULT_CLIP_SECONDS = 60.0
-DEFAULT_FRAME_STEP = 12
+DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT = 20.0
+BRIGHTNESS_SAMPLE_SECONDS = 1.0
+BRIGHTNESS_MIN_EDGE_GRADIENT = 8.0
+BRIGHTNESS_MAX_LINE_RESIDUAL_PX = 3.0
+BRIGHTNESS_MIN_LINE_POINTS = 5
+CONFIRM_WINDOW_SAMPLES = 4
+CONFIRM_HITS = 2
+RELEASE_GAP_SECONDS = 1.5
 WATCH_POLL_SECONDS = 30.0
 WATCH_SETTLE_SECONDS = 120.0
 ANALYZED_LIST_NAME = "analyzed.txt"
+DEFAULT_RECORDINGS_ROOT = Path("/opt/cameras/recordings")
+DEFAULT_CAMERA = "POE_BRAMA"
+RECORDING_NAME_PATTERN = re.compile(r"^(\d{2})-(\d{2})-(\d{2})\.mkv$")
 
 
 def _log(message: str, flush: bool = True) -> None:
     """Komunikat na ekran z czasem zegarowym [GG:MM:SS] (nie z nagrania)."""
     print(f"{datetime.now():[%H:%M:%S]} {message}", flush=flush)
-DEFAULT_RECORDINGS_ROOT = Path("/opt/cameras/recordings")
-DEFAULT_CAMERA = "POE_BRAMA"
-RECORDING_NAME_PATTERN = re.compile(r"^(\d{2})-(\d{2})-(\d{2})\.mkv$")
-CONFIRM_WINDOW_FRAMES = 5
-CONFIRM_HITS = 3
-RELEASE_GAP_SECONDS = 1.5
-SEARCH_RETRY_SECONDS = 15.0
-SEARCH_GRID_SECONDS = 60.0
-LOST_TRACKING_SECONDS = 15.0
-ANCHOR_SEARCH_RADIUS_PX = 120.0
-SIZE_DETECTOR_ENABLED = False
-# Kamera co ok. 4 s odświeża cały obraz (skok szumu i tekstury ściany o kilka
-# poziomów szarości); zwykła różnica między klatkami wynosi < 1, skok ok. 4,5.
-CAMERA_JUMP_THRESHOLD = 2.5
-CAMERA_JUMP_HALF_WIDTH = 300
-CAMERA_JUMP_HALF_HEIGHT = 200
-SIZE_SAMPLE_SECONDS = 10.0
-SIZE_HISTORY_SAMPLES = 30
-SIZE_MIN_HISTORY = 6
-SIZE_WINDOW_HALF_WIDTH = 22
-SIZE_WINDOW_HALF_HEIGHT = 30
-SIZE_MIN_DARK_PX = 400
-SIZE_MAX_EVENT_SECONDS = 120.0
-SIZE_GROWTH_FACTOR = 5.0
-
-
-def _sample_calibration_frames(
-    capture: cv2.VideoCapture, fps: float, start_frame: int = 0
-) -> list[np.ndarray]:
-    interval = max(1, int(round(fps * SAMPLE_INTERVAL_SECONDS)))
-    sample_count = int(round(SAMPLE_SECONDS * fps / interval)) + 1
-    frames: list[np.ndarray] = []
-
-    for sample_index in range(sample_count):
-        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame + sample_index * interval)
-        ok, frame = capture.read()
-        if not ok:
-            break
-        frames.append(frame)
-
-    return frames
-
-
-def _prepare_for_matching(image: np.ndarray) -> np.ndarray:
-    """Mapa krawędzi niezależna od jasności i kontrastu (noc, słońce, mgła)."""
-    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(cv2.createCLAHE(3.0, (8, 8)).apply(gray), (0, 0), 1.2)
-    magnitude = cv2.magnitude(
-        cv2.Sobel(gray, cv2.CV_32F, 1, 0), cv2.Sobel(gray, cv2.CV_32F, 0, 1)
-    )
-    return magnitude + _flat_area_noise(magnitude.shape)
-
-
-@lru_cache(maxsize=4)
-def _flat_area_noise(shape: tuple[int, ...]) -> np.ndarray:
-    # Płaskie (prześwietlone) obszary mają zerową wariancję i dawałyby fałszywe
-    # dopasowania o wyniku 1,0.
-    return np.random.default_rng(0).random(shape, dtype=np.float32) * 4.0
-
-
-@dataclass(frozen=True)
-class _AnchorTemplate:
-    scaled: tuple[tuple[float, np.ndarray], ...]
-    offset: tuple[float, float]
-
-
-@lru_cache(maxsize=1)
-def _load_anchor_templates() -> Optional[tuple[_AnchorTemplate, _AnchorTemplate]]:
-    templates: list[_AnchorTemplate] = []
-    for spec in (CHIMNEY_ANCHOR, RIDGE_ANCHOR):
-        image = cv2.imread(str(REFERENCE_DIR / spec.file_name), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            return None
-        edges = _prepare_for_matching(image)
-        scaled = tuple(
-            (float(scale), cv2.resize(edges, None, fx=scale, fy=scale))
-            for scale in ANCHOR_SCALES
-        )
-        offset = (
-            spec.anchor[0] - spec.crop_origin[0],
-            spec.anchor[1] - spec.crop_origin[1],
-        )
-        templates.append(_AnchorTemplate(scaled, offset))
-    return templates[0], templates[1]
-
-
-def _find_anchor(
-    edges: np.ndarray,
-    template: _AnchorTemplate,
-    expected: Optional[tuple[float, float]] = None,
-    radius: float = ANCHOR_SEARCH_RADIUS_PX,
-) -> tuple[float, np.ndarray]:
-    """Najlepsze dopasowanie wzorca; z `expected` tylko w promieniu od oczekiwanego punktu."""
-    best_score, best_point = -1.0, np.zeros(2)
-    for scale, scaled in template.scaled:
-        if scaled.shape[0] > edges.shape[0] or scaled.shape[1] > edges.shape[1]:
-            continue
-        result = cv2.matchTemplate(edges, scaled, cv2.TM_CCOEFF_NORMED)
-        if expected is not None:
-            center_x = expected[0] - template.offset[0] * scale
-            center_y = expected[1] - template.offset[1] * scale
-            left = max(0, int(center_x - radius))
-            top = max(0, int(center_y - radius))
-            right = int(center_x + radius) + 1
-            bottom = int(center_y + radius) + 1
-            if left >= result.shape[1] or top >= result.shape[0] or right <= 0 or bottom <= 0:
-                continue
-            restricted = np.full_like(result, -1.0)
-            restricted[top:bottom, left:right] = result[top:bottom, left:right]
-            result = restricted
-        _, score, _, location = cv2.minMaxLoc(result)
-        if score > best_score:
-            best_score = float(score)
-            best_point = np.array(location, dtype=float) + np.array(template.offset) * scale
-    return best_score, best_point
-
-
-def _opening_from_triangle(
-    chimney: np.ndarray, ridge: np.ndarray, frame_shape: tuple[int, ...]
-) -> Optional[tuple[float, float]]:
-    """Trójkąt podobny: komin–szczyt dachu–otwór ze wzorca przeniesiony na klatkę."""
-    reference_vector = np.array(RIDGE_ANCHOR.anchor) - np.array(CHIMNEY_ANCHOR.anchor)
-    vector = ridge - chimney
-    scale = float(np.linalg.norm(vector) / np.linalg.norm(reference_vector))
-    angle = math.atan2(vector[1], vector[0]) - math.atan2(
-        reference_vector[1], reference_vector[0]
-    )
-    angle = (angle + math.pi) % (2 * math.pi) - math.pi
-    if (
-        not TRIANGLE_MIN_SCALE <= scale <= TRIANGLE_MAX_SCALE
-        or abs(math.degrees(angle)) > TRIANGLE_MAX_ANGLE_DEG
-    ):
-        return None
-    rotation = np.array(
-        [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]]
-    )
-    offset = np.array(REFERENCE_OPENING) - np.array(CHIMNEY_ANCHOR.anchor)
-    x, y = chimney + scale * rotation @ offset
-    height, width = frame_shape[:2]
-    if 0 <= x < width and 0 <= y < height:
-        return float(x), float(y)
-    return None
-
-
-def _estimate_opening(
-    frame: np.ndarray, templates: tuple[_AnchorTemplate, _AnchorTemplate]
-) -> Optional[tuple[float, float]]:
-    edges = _prepare_for_matching(frame)
-    # Najpierw blisko wzorcowych położeń (kamera prawie się nie rusza); słabe
-    # dopasowanie bywa inaczej przechwytywane przez drzewo w innym miejscu kadru.
-    for chimney_hint, ridge_hint, min_score in (
-        (
-            tuple(map(float, CHIMNEY_ANCHOR.anchor)),
-            tuple(map(float, RIDGE_ANCHOR.anchor)),
-            ANCHOR_HINT_MIN_SCORE,
-        ),
-        (None, None, ANCHOR_MIN_SCORE),
-    ):
-        chimney_score, chimney = _find_anchor(edges, templates[0], chimney_hint)
-        ridge_score, ridge = _find_anchor(edges, templates[1], ridge_hint)
-        if min(chimney_score, ridge_score) < min_score:
-            continue
-        opening = _opening_from_triangle(chimney, ridge, frame.shape)
-        if opening is not None:
-            return opening
-    return None
-
-
-def _probe_reference(capture: cv2.VideoCapture, frame_index: int) -> bool:
-    """Szybki test: czy jedna klatka daje komin i szczyt dachu (otwór wyliczalny)."""
-    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-    ok, frame = capture.read()
-    if not ok:
-        return False
-    return locate_opening_by_triangle([frame], min_estimates=1) is not None
-
-
-def locate_opening_by_triangle(
-    frames: Iterable[np.ndarray],
-    min_estimates: int = 2,
-) -> Optional[OpeningCandidate]:
-    """Wylicza położenie otworu z dwóch punktów: komina i szczytu dachu.
-
-    Oba punkty leżą na tle nieba, więc cień na ścianie ani drzewa nie psują
-    wyniku. Z ich odległości i kąta wynika skala i obrót względem wzorca, a
-    otwór jest trzecim wierzchołkiem podobnego trójkąta, także gdy go nie
-    widać. Zwraca None, gdy komina lub szczytu dachu nie da się wiarygodnie
-    znaleźć albo wyniki z kolejnych klatek się rozjeżdżają.
-    """
-    templates = _load_anchor_templates()
-    if templates is None:
-        return None
-    estimates: list[tuple[float, float]] = []
-    sample_count = 0
-
-    for frame in frames:
-        sample_count += 1
-        estimate = _estimate_opening(frame, templates)
-        if estimate is not None:
-            estimates.append(estimate)
-
-    if sample_count == 0 or len(estimates) < max(min_estimates, sample_count // 2):
-        return None
-    xs, ys = zip(*estimates)
-    median_x, median_y = float(np.median(xs)), float(np.median(ys))
-    spread = max(
-        float(np.hypot(x - median_x, y - median_y)) for x, y in estimates
-    )
-    if spread > REFERENCE_MAX_SPREAD_PX:
-        return None
-    return OpeningCandidate(median_x, median_y, float(len(estimates)))
-
-
-def _find_opening(
-    capture: cv2.VideoCapture,
-    fps: float,
-    frame_count: int,
-    start_frame: int,
-    retry_frames: int,
-) -> Optional[tuple[OpeningCandidate, np.ndarray, int]]:
-    """Szuka momentu, od którego komin i szczyt dachu są wiarygodnie widoczne.
-
-    1. Rzadka siatka (co `SEARCH_GRID_SECONDS`): w każdym punkcie jedna klatka
-       (ok. 1,5 s zamiast ok. 20 s na 13 klatek).
-    2. Po trafieniu bisekcja między ostatnim punktem bez trójkąta a trafionym, do
-       dokładności `retry_frames`; wynik potwierdza dopasowanie 13 klatek.
-    Otwór wylicza się z trójkąta, więc nie musi być widoczny.
-    """
-    grid = max(retry_frames, int(round(fps * SEARCH_GRID_SECONDS)))
-    _log(
-        f"[{_format_elapsed(start_frame / fps)}] Szukam komina i szczytu dachu: "
-        f"siatka co {grid / fps:.0f} s, potem bisekcja.",
-        flush=True,
-    )
-
-    hidden: Optional[int] = None
-    index = start_frame
-    while index < frame_count:
-        if not _probe_reference(capture, index):
-            hidden = index
-            index += grid
-            continue
-        first = index
-        if hidden is not None:
-            low, high = hidden, index
-            while high - low > retry_frames:
-                middle = (low + high) // 2
-                if _probe_reference(capture, middle):
-                    high = middle
-                else:
-                    low = middle
-            first = high
-        frames = _sample_calibration_frames(capture, fps, first)
-        opening = locate_opening_by_triangle(frames) if frames else None
-        if opening is not None:
-            _log(
-                f"[{_format_elapsed(first / fps)}] Otwór wyliczony z trójkąta "
-                f"komin–szczyt dachu: ({opening.x:.0f}, {opening.y:.0f}).",
-                flush=True,
-            )
-            return opening, frames[0], first
-        hidden = first
-        index = first + grid
-    return None
-
-
-def track_opening(
-    frame: np.ndarray, reference_gray: np.ndarray, opening: OpeningCandidate
-) -> TrackResult:
-    height, width = reference_gray.shape
-    center_x, center_y = int(round(opening.x)), int(round(opening.y))
-    radius = TEMPLATE_RADIUS
-    if (
-        center_x - radius < 0
-        or center_y - radius < 0
-        or center_x + radius > width
-        or center_y + radius > height
-    ):
-        return TrackResult(center_x, center_y, 0.0)
-
-    template = reference_gray[
-        center_y - radius:center_y + radius,
-        center_x - radius:center_x + radius,
-    ]
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    search = SEARCH_RADIUS
-    x1, y1 = max(0, center_x - radius - search), max(0, center_y - radius - search)
-    x2 = min(width, center_x + radius + search)
-    y2 = min(height, center_y + radius + search)
-    search_area = gray[y1:y2, x1:x2]
-    match = cv2.matchTemplate(search_area, template, cv2.TM_CCOEFF_NORMED)
-    _, confidence, _, location = cv2.minMaxLoc(match)
-    return TrackResult(
-        x1 + location[0] + radius,
-        y1 + location[1] + radius,
-        float(confidence),
-    )
-
-
-@dataclass
-class AdaptiveBackground:
-    image: np.ndarray
-    changed_frames: np.ndarray
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self.image.shape
-
-
-def _reference_window(
-    reference_gray: np.ndarray, opening: OpeningCandidate
-) -> Optional[AdaptiveBackground]:
-    """Okno wokół otworu o stałym rozmiarze; None, gdy wychodzi poza obraz."""
-    center_x, center_y = int(round(opening.x)), int(round(opening.y))
-    x1, x2 = center_x - ROI_HALF_WIDTH, center_x + ROI_HALF_WIDTH
-    y1, y2 = center_y - ROI_TOP, center_y + ROI_BOTTOM
-    height, width = reference_gray.shape
-    if x1 < 0 or y1 < 0 or x2 > width or y2 > height:
-        return None
-    image = reference_gray[y1:y2, x1:x2].astype(np.float32)
-    return AdaptiveBackground(image, np.zeros(image.shape, dtype=np.uint16))
-
-
-def _update_background(
-    background: AdaptiveBackground,
-    frame: np.ndarray,
-    bounds: tuple[int, int, int, int],
-    mask: np.ndarray,
-    fps: float,
-) -> None:
-    """Powoli wtapia obraz w tło; zmiany (wiewiórka) są chwilowo zamrożone.
-
-    Zmiana trwająca dłużej niż BACKGROUND_FREEZE_SECONDS jest uznawana za trwałą
-    (np. oświetlenie) i też trafia do tła.
-    """
-    x1, y1, x2, y2 = bounds
-    if (y2 - y1, x2 - x1) != background.shape:
-        return
-    gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-    changed = cv2.dilate(mask, np.ones((9, 9), dtype=np.uint8)) > 0
-    counts = background.changed_frames
-    counts[changed] = np.minimum(counts[changed], 65534) + 1
-    counts[~changed] = 0
-    freeze_frames = int(BACKGROUND_FREEZE_SECONDS * fps)
-    allowed = ((~changed) | (counts > freeze_frames)).astype(np.uint8) * 255
-    cv2.accumulateWeighted(gray, background.image, BACKGROUND_ALPHA, allowed)
-
-
-def _activity_mask(
-    frame: np.ndarray,
-    reference_gray: np.ndarray,
-    opening: OpeningCandidate,
-    tracked: TrackResult,
-    background: Optional[AdaptiveBackground] = None,
-) -> tuple[Optional[np.ndarray], Optional[tuple[int, int, int, int]], float]:
-    if tracked.confidence < MIN_TRACK_CONFIDENCE:
-        return None, None, 0.0
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    x1 = max(0, tracked.x - ROI_HALF_WIDTH)
-    x2 = min(gray.shape[1], tracked.x + ROI_HALF_WIDTH)
-    y1 = max(0, tracked.y - ROI_TOP)
-    y2 = min(gray.shape[0], tracked.y + ROI_BOTTOM)
-    ref_x1 = x1 + int(round(opening.x - tracked.x))
-    ref_y1 = y1 + int(round(opening.y - tracked.y))
-    reference_roi = reference_gray[ref_y1:ref_y1 + y2 - y1, ref_x1:ref_x1 + x2 - x1]
-    current_roi = gray[y1:y2, x1:x2]
-    if background is not None and background.shape == current_roi.shape:
-        reference_roi = cv2.convertScaleAbs(background.image)
-    if reference_roi.shape != current_roi.shape or current_roi.size == 0:
-        return None, None, 0.0
-
-    # Wiewiórka jest ciemniejsza od tła; rozjaśnienia (światło, kompresja) pomijamy.
-    # Globalna zmiana ekspozycji (mediana różnicy) jest odejmowana, bo mała
-    # wiewiórka jej nie zmienia.
-    exposure_shift = float(np.median(current_roi.astype(np.int16) - reference_roi))
-    reference_roi = cv2.convertScaleAbs(reference_roi, alpha=1.0, beta=exposure_shift)
-    difference = cv2.subtract(reference_roi, current_roi)
-    difference = cv2.GaussianBlur(difference, (3, 3), 0)
-    _, mask = cv2.threshold(difference, 25, 255, cv2.THRESH_BINARY)
-    # Cień, słońce i zmiana ekspozycji tylko nieco przyciemniają jasną ścianę;
-    # wiewiórka jest wielokrotnie ciemniejsza niż tło.
-    much_darker = current_roi < reference_roi * MIN_DARKENING_RATIO
-    mask[~much_darker] = 0
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    ratio = float(cv2.countNonZero(mask) / mask.size)
-    return mask, (x1, y1, x2, y2), ratio
-
-
-def activity_regions(
-    mask: np.ndarray,
-    min_diagonal_px: float,
-    min_side_px: int = MIN_REGION_SIDE_PX,
-    max_aspect: float = MAX_REGION_ASPECT,
-) -> tuple[list[ActivityRegion], float]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    accepted: list[ActivityRegion] = []
-    largest_diagonal = 0.0
-
-    for contour in contours:
-        x, y, width, height = cv2.boundingRect(contour)
-        diagonal = math.hypot(width, height)
-        largest_diagonal = max(largest_diagonal, diagonal)
-        if (
-            diagonal > min_diagonal_px
-            and min(width, height) >= min_side_px
-            and max(width, height) / max(1, min(width, height)) <= max_aspect
-        ):
-            accepted.append(ActivityRegion(x, y, width, height, diagonal))
-
-    accepted.sort(key=lambda region: region.diagonal, reverse=True)
-    return accepted, largest_diagonal
 
 
 class AppearanceDetector:
-    def __init__(self, fps: float, frame_step: int = 1):
-        # Przy rzadszej analizie okno liczone w próbkach jest krótsze (3 z 5
-        # klatek co 1 klatkę odpowiada ok. 2 z 4 próbek).
-        sparse = frame_step > 1
-        self._window = 4 if sparse else CONFIRM_WINDOW_FRAMES
-        self._hits = 2 if sparse else CONFIRM_HITS
-        self._history: deque[tuple[int, bool]] = deque(maxlen=self._window)
+    def __init__(self, fps: float):
+        self._history: deque[tuple[int, bool]] = deque(maxlen=CONFIRM_WINDOW_SAMPLES)
         self._release_gap_frames = max(1, int(round(fps * RELEASE_GAP_SECONDS)))
         self._active = False
         self._last_seen_frame: Optional[int] = None
 
-    def update(self, frame_index: int, has_large_region: bool) -> Optional[Appearance]:
+    def update(self, frame_index: int, signal: bool) -> Optional[Appearance]:
         if self._active:
-            if has_large_region:
+            if signal:
                 self._last_seen_frame = frame_index
             if (
                 self._last_seen_frame is not None
@@ -533,108 +81,17 @@ class AppearanceDetector:
                 self._history.clear()
             return None
 
-        self._history.append((frame_index, has_large_region))
-        if len(self._history) < self._window:
+        self._history.append((frame_index, signal))
+        if len(self._history) < CONFIRM_WINDOW_SAMPLES:
             return None
 
         positive_frames = [index for index, detected in self._history if detected]
-        if len(positive_frames) < self._hits:
+        if len(positive_frames) < CONFIRM_HITS:
             return None
 
         self._active = True
         self._last_seen_frame = positive_frames[-1]
         return Appearance(start_frame=positive_frames[0])
-
-
-class OpeningSizeDetector:
-    """Wykrywa powolną wiewiórkę przez rzadki pomiar „wielkości dziury”.
-
-    Co SIZE_SAMPLE_SECONDS liczy ciemne piksele w małym oknie wokół otworu
-    względem mediany ostatnich próbek (ok. 5 min). Zdarzenie, gdy ich liczba jest
-    co najmniej SIZE_GROWTH_FACTOR razy większa niż zwykle i nie mniejsza niż
-    SIZE_MIN_DARK_PX. Zdarzenie jest zgłaszane dopiero po powrocie do normy i
-    tylko gdy powiększenie trwało krócej niż SIZE_MAX_EVENT_SECONDS; dłuższe to
-    zmiana światła, po której baza porównawcza budowana jest od nowa. Łapie wiewiórkę, która rusza się zbyt wolno dla porównania
-    klatek z tłem adaptacyjnym albo jest mała.
-    """
-
-    def __init__(self, fps: float):
-        self._sample_frames = max(1, int(round(fps * SIZE_SAMPLE_SECONDS)))
-        self._next_sample_frame = 0
-        self._history: deque[np.ndarray] = deque(maxlen=SIZE_HISTORY_SAMPLES)
-        self._counts: deque[int] = deque(maxlen=SIZE_HISTORY_SAMPLES)
-        self._active = False
-        self._run_start: Optional[int] = None
-        self._max_run_frames = int(round(fps * SIZE_MAX_EVENT_SECONDS))
-
-    def rearm(self) -> None:
-        # Po przeskoku analizy baza porównawcza jest nieaktualna, więc budowana od nowa.
-        self._active = False
-        self._run_start = None
-        self._next_sample_frame = 0
-        self._history.clear()
-        self._counts.clear()
-
-    def update(
-        self, frame_index: int, frame: np.ndarray, x: int, y: int
-    ) -> Optional[Appearance]:
-        if frame_index < self._next_sample_frame:
-            return None
-        self._next_sample_frame = frame_index + self._sample_frames
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        x1, x2 = x - SIZE_WINDOW_HALF_WIDTH, x + SIZE_WINDOW_HALF_WIDTH
-        y1, y2 = y - SIZE_WINDOW_HALF_HEIGHT, y + SIZE_WINDOW_HALF_HEIGHT
-        if x1 < 0 or y1 < 0 or x2 > gray.shape[1] or y2 > gray.shape[0]:
-            return None
-        window = gray[y1:y2, x1:x2].astype(np.float32)
-        appearance: Optional[Appearance] = None
-        if len(self._history) >= SIZE_MIN_HISTORY:
-            background = np.median(np.stack(self._history), axis=0)
-            difference = background - window
-            difference -= np.median(difference)
-            count = int(
-                ((difference > 25) & (window < MIN_DARKENING_RATIO * background)).sum()
-            )
-            usual = float(np.median(self._counts)) if self._counts else 0.0
-            enlarged = count >= max(SIZE_MIN_DARK_PX, SIZE_GROWTH_FACTOR * usual)
-            if enlarged:
-                if self._run_start is None:
-                    self._run_start = frame_index
-                if frame_index - self._run_start > self._max_run_frames:
-                    # Trwała zmiana (światło, cień), nie zwierzę.
-                    self._run_start = None
-                    self._history.clear()
-                    self._counts.clear()
-                return None
-            self._counts.append(count)
-            if self._run_start is not None:
-                appearance = Appearance(start_frame=self._run_start)
-                self._run_start = None
-        self._history.append(window)
-        return appearance
-
-
-def _jump_window(frame: np.ndarray, opening: OpeningCandidate) -> np.ndarray:
-    """Szary, szeroki wycinek wokół otworu do wykrywania skoku obrazu kamery."""
-    center_x, center_y = int(round(opening.x)), int(round(opening.y))
-    x1 = max(0, center_x - CAMERA_JUMP_HALF_WIDTH)
-    y1 = max(0, center_y - CAMERA_JUMP_HALF_HEIGHT)
-    window = frame[y1:center_y + CAMERA_JUMP_HALF_HEIGHT, x1:center_x + CAMERA_JUMP_HALF_WIDTH]
-    return cv2.cvtColor(window, cv2.COLOR_BGR2GRAY)
-
-
-def is_camera_jump(previous: Optional[np.ndarray], current: np.ndarray) -> bool:
-    if previous is None or previous.shape != current.shape:
-        return False
-    return float(cv2.absdiff(previous, current).mean()) > CAMERA_JUMP_THRESHOLD
-
-
-def _format_elapsed(seconds: float) -> str:
-    total_milliseconds = max(0, int(round(seconds * 1000)))
-    hours, remainder = divmod(total_milliseconds, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    whole_seconds, milliseconds = divmod(remainder, 1000)
-    return f"{hours:02d}-{minutes:02d}-{whole_seconds:02d}-{milliseconds:03d}"
 
 
 def _recording_start_time(video_path: Path, video_duration: float) -> datetime:
@@ -763,277 +220,417 @@ def _save_appearance_clips(
     return clip_paths
 
 
-def analyze_video(
-    video_path: Path,
-    output_path: Optional[Path] = None,
-    mode: str = "all",
-    min_diagonal_px: float = DEFAULT_MIN_DIAGONAL_PX,
-    clip_seconds: float = DEFAULT_CLIP_SECONDS,
-    save_preview: bool = False,
-    frame_step: int = DEFAULT_FRAME_STEP,
-) -> Path:
-    if mode not in {"first", "all"}:
-        raise ValueError("Tryb musi mieć wartość 'first' albo 'all'.")
-    if min_diagonal_px < 0:
-        raise ValueError("Minimalna przekątna nie może być ujemna.")
-    if frame_step < 1:
-        raise ValueError("Krok klatek musi być co najmniej 1.")
-    if clip_seconds <= 0:
-        raise ValueError("Długość klipu musi być większa od zera.")
+def _fit_wall_line(
+    points: Sequence[tuple[int, int]], vertical: bool = False
+) -> tuple[float, float, float]:
+    samples = np.asarray(points, dtype=np.float64)
+    if samples.ndim != 2 or samples.shape[0] < BRIGHTNESS_MIN_LINE_POINTS:
+        raise ValueError("za mało punktów krawędzi do dopasowania prostej")
 
+    x_values, y_values = samples.T
+    independent = y_values if vertical else x_values
+    dependent = x_values if vertical else y_values
+    if np.ptp(independent) < 1:
+        raise ValueError("punkty krawędzi nie rozciągają się wzdłuż prostej")
+
+    inlier_limit = max(2.0, BRIGHTNESS_MAX_LINE_RESIDUAL_PX)
+    best_inliers: Optional[np.ndarray] = None
+    best_key = (-1, float("inf"))
+    for first in range(len(independent)):
+        for second in range(first + 1, len(independent)):
+            delta = independent[second] - independent[first]
+            if delta == 0:
+                continue
+            candidate_slope = (
+                dependent[second] - dependent[first]
+            ) / delta
+            candidate_intercept = (
+                dependent[first] - candidate_slope * independent[first]
+            )
+            residuals = np.abs(
+                dependent - (candidate_slope * independent + candidate_intercept)
+            ) / math.sqrt(1.0 + candidate_slope * candidate_slope)
+            inliers = residuals <= inlier_limit
+            inlier_count = int(inliers.sum())
+            inlier_error = float(np.mean(np.square(residuals[inliers])))
+            key = (inlier_count, -inlier_error)
+            if key > best_key:
+                best_key = key
+                best_inliers = inliers
+
+    if best_inliers is None:
+        raise ValueError("punkty krawędzi nie rozciągają się wzdłuż prostej")
+    inliers = best_inliers
+    if int(inliers.sum()) < BRIGHTNESS_MIN_LINE_POINTS:
+        raise ValueError("za mało zgodnych punktów krawędzi")
+
+    independent = independent[inliers]
+    dependent = dependent[inliers]
+    slope, intercept = np.polyfit(independent, dependent, 1)
+    residuals = dependent - (slope * independent + intercept)
+    sigma = float(np.sqrt(np.mean(np.square(residuals)) / (1.0 + slope * slope)))
+    if sigma > BRIGHTNESS_MAX_LINE_RESIDUAL_PX:
+        raise ValueError("zbyt duży rozrzut punktów dopasowanej krawędzi")
+    return float(slope), float(intercept), sigma
+
+
+def _wall_intersection(
+    vertical: tuple[float, float, float],
+    horizontal: tuple[float, float, float],
+) -> tuple[float, float]:
+    vertical_slope, vertical_intercept, _ = vertical
+    horizontal_slope, horizontal_intercept, _ = horizontal
+    denominator = 1.0 - horizontal_slope * vertical_slope
+    if abs(denominator) < 1e-8:
+        raise ValueError("dopasowane linie są równoległe")
+    y = (
+        horizontal_slope * vertical_intercept + horizontal_intercept
+    ) / denominator
+    return vertical_slope * y + vertical_intercept, y
+
+
+def _measure_opening_brightness(
+    frame: np.ndarray, offset_x: int = 0, offset_y: int = 0
+) -> BrightnessMeasurement:
+    """Measure grayscale in the test/reference boxes located by wall lines."""
+    height, width = frame.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("pusta klatka")
+    if (
+        344 + offset_x < 1
+        or 460 + offset_x >= width - 1
+        or 678 + offset_y < 1
+        or 825 + offset_y >= height - 1
+        or 825 + offset_y + 13 >= height - 1
+    ):
+        raise ValueError("pas wyszukiwania linii poza klatką")
+
+    red_points: list[tuple[int, int]] = []
+    red_strengths: list[float] = []
+    for y in np.linspace(680 + offset_y, 825 + offset_y, 10).round().astype(int):
+        x_candidates = range(346 + offset_x, 369 + offset_x)
+        scores = [
+            float(
+                np.linalg.norm(
+                    frame[y, x + 1].astype(np.float32)
+                    - frame[y, x - 1].astype(np.float32)
+                )
+            )
+            for x in x_candidates
+        ]
+        best_x = 346 + offset_x + int(np.argmax(scores))
+        red_points.append((best_x, int(y)))
+        red_strengths.append(max(scores))
+
+    blue_points: list[tuple[int, int]] = []
+    blue_strengths: list[float] = []
+    for x in np.linspace(278 + offset_x, 340 + offset_x, 10).round().astype(int):
+        y_candidates = range(738 + offset_y, 776 + offset_y)
+        scores = [
+            float(
+                np.linalg.norm(
+                    frame[y + 1, x].astype(np.float32)
+                    - frame[y - 1, x].astype(np.float32)
+                )
+            )
+            for y in y_candidates
+        ]
+        best_y = 738 + offset_y + int(np.argmax(scores))
+        blue_points.append((int(x), best_y))
+        blue_strengths.append(max(scores))
+
+    yellow_points: list[tuple[int, int]] = []
+    yellow_strengths: list[float] = []
+    yellow_x_values = np.r_[
+        np.linspace(362 + offset_x, 386 + offset_x, 5),
+        np.linspace(442 + offset_x, 458 + offset_x, 5),
+    ].round().astype(int)
+    for x in yellow_x_values:
+        center_y = 752 + offset_y + 0.55 * (x - (355 + offset_x))
+        y_candidates = np.arange(round(center_y - 13), round(center_y + 14))
+        scores = [
+            float(
+                np.linalg.norm(
+                    frame[y + 1, x].astype(np.float32)
+                    - frame[y - 1, x].astype(np.float32)
+                )
+            )
+            for y in y_candidates
+        ]
+        best_y = int(y_candidates[int(np.argmax(scores))])
+        yellow_points.append((int(x), best_y))
+        yellow_strengths.append(max(scores))
+
+    for points in (red_points, blue_points, yellow_points):
+        if any(x < 1 or x >= width - 1 or y < 1 or y >= height - 1 for x, y in points):
+            raise ValueError("pas wyszukiwania linii poza klatką")
+    if any(
+        sum(strength >= BRIGHTNESS_MIN_EDGE_GRADIENT for strength in strengths)
+        < BRIGHTNESS_MIN_LINE_POINTS
+        for strengths in (red_strengths, blue_strengths, yellow_strengths)
+    ):
+        raise ValueError("zbyt słaby kontrast krawędzi ściany")
+
+    red = _fit_wall_line(red_points, vertical=True)
+    blue = _fit_wall_line(blue_points)
+    yellow = _fit_wall_line(yellow_points)
+    intersections = (
+        _wall_intersection(red, blue),
+        _wall_intersection(red, yellow),
+    )
+    cross_x = float(np.mean([point[0] for point in intersections]))
+    cross_y = float(np.mean([point[1] for point in intersections]))
+    if math.dist(*intersections) > 20.0:
+        raise ValueError("przecięcia linii niebieskiej i żółtej są zbyt odległe")
+    if not (320 + offset_x <= cross_x <= 400 + offset_x):
+        raise ValueError("przecięcie poza zakresem poziomym otworu")
+    if not (700 + offset_y <= cross_y <= 850 + offset_y):
+        raise ValueError("przecięcie poza zakresem pionowym otworu")
+
+    test_x = round(cross_x - 12)
+    test_y = round(cross_y - 19)
+    test_x_end = round(cross_x - 2)
+    test_y_end = round(cross_y - 2)
+    if test_x_end - test_x != 10 or test_y_end - test_y != 17:
+        raise ValueError("nieprawidłowy rozmiar pola testowego")
+    reference_x = test_x - 2
+    reference_y_end = test_y - 5
+    reference_y = reference_y_end - 17
+    if (
+        reference_x < 0
+        or reference_y < 0
+        or test_x < 0
+        or test_y < 0
+        or test_x_end > width
+        or test_y_end > height
+        or reference_x + 10 > width
+        or reference_y_end > height
+    ):
+        raise ValueError("pole jasności wychodzi poza klatkę")
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    test_mean = float(gray[test_y:test_y_end, test_x:test_x_end].mean())
+    reference_mean = float(
+        gray[reference_y:reference_y_end, reference_x : reference_x + 10].mean()
+    )
+    if reference_mean <= 0:
+        raise ValueError("jasność pola odniesienia wynosi zero")
+    signed_difference = test_mean - reference_mean
+    absolute_difference = abs(signed_difference)
+    return BrightnessMeasurement(
+        cross_x=cross_x,
+        cross_y=cross_y,
+        test_x=test_x,
+        test_y=test_y,
+        reference_x=reference_x,
+        reference_y=reference_y,
+        test_mean=test_mean,
+        reference_mean=reference_mean,
+        signed_difference=signed_difference,
+        absolute_difference=absolute_difference,
+        difference_percent=absolute_difference / reference_mean * 100.0,
+    )
+
+
+def _analyze_brightness_video(
+    video_path: Path,
+    csv_path: Path,
+    fps: float,
+    frame_count: int,
+    recording_start: datetime,
+    threshold_percent: float,
+    clip_seconds: float,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    mode: str = "all",
+) -> tuple[list[Appearance], int, int]:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
-        raise RuntimeError(f"Nie można otworzyć pliku: {video_path}")
+        raise RuntimeError(f"Nie można otworzyć pliku do pomiaru jasności: {video_path}")
 
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if fps <= 0 or width <= 0 or height <= 0:
-        capture.release()
-        raise RuntimeError("Nie udało się odczytać parametrów nagrania.")
-
-    recording_start = _recording_start_time(video_path, frame_count / fps)
-    output_path = _reserve_output_path(
-        _timestamped_output_path(video_path, output_path, recording_start)
-    )
-    output_size = (max(2, width // 2), max(2, height // 2))
-    writer: Optional[cv2.VideoWriter] = None
-    if save_preview:
-        writer = cv2.VideoWriter(
-            str(output_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps / frame_step,
-            output_size,
-        )
-        if not writer.isOpened():
-            capture.release()
-            output_path.unlink(missing_ok=True)
-            raise RuntimeError(f"Nie można utworzyć podglądu: {output_path}")
-
-    csv_path = output_path.with_suffix(".csv")
-    frame_index = 0
-    detector = AppearanceDetector(fps, frame_step)
-    size_detector = OpeningSizeDetector(fps)
+    sample_step_frames = max(1, int(round(fps * BRIGHTNESS_SAMPLE_SECONDS)))
+    detector = AppearanceDetector(fps)
     appearances: list[Appearance] = []
-    retry_frames = max(1, int(round(fps * SEARCH_RETRY_SECONDS)))
-    analyzed_fps = fps / frame_step
-    lost_limit = max(1, int(round(analyzed_fps * LOST_TRACKING_SECONDS)))
-    opening: Optional[OpeningCandidate] = None
-    last_opening: Optional[OpeningCandidate] = None
-    reference_gray: Optional[np.ndarray] = None
-    background: Optional[AdaptiveBackground] = None
-    lost_frames = 0
-    previous_window: Optional[np.ndarray] = None
-    interval_jump = False
+    valid_rows = 0
+    invalid_rows = 0
+    threshold_hits = 0
+    minimum_clip_gap = int(round(fps * clip_seconds))
+    headers = [
+        "czas_nagrania",
+        "czas_s",
+        "klatka_video",
+        "krzyzyk_x_px",
+        "krzyzyk_y_px",
+        "test_x_lewy_px",
+        "test_y_gorny_px",
+        "odniesienie_x_lewy_px",
+        "odniesienie_y_gorny_px",
+        "jasnosc_testowa_srednia_0_255",
+        "jasnosc_odniesienia_srednia_0_255",
+        "roznica_test_minus_odniesienie",
+        "roznica_bezwzgledna",
+        "roznica_procent_wzgledem_odniesienia",
+        "sygnal_progu",
+        "zdarzenie_potwierdzone",
+        "poczatek_klipu",
+        "status",
+    ]
+
     try:
-        with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
-            rows = csv.writer(csv_file)
-            rows.writerow(
-                [
-                    "czas_s",
-                    "x_otworu",
-                    "y_otworu",
-                    "pewnosc_sledzenia",
-                    "zmieniony_obszar",
-                    "najwieksza_przekatna_px",
-                    "duze_obszary",
-                    "zdarzenie",
-                ]
-            )
-
-            while True:
-                if opening is None:
-                    found = _find_opening(
-                        capture,
-                        fps,
-                        frame_count,
-                        frame_index,
-                        retry_frames,
-                    )
-                    if found is None:
-                        break
-                    opening, found_frame, frame_index = found
-                    last_opening = opening
-                    reference_gray = cv2.cvtColor(found_frame, cv2.COLOR_BGR2GRAY)
-                    background = _reference_window(reference_gray, opening)
-                    lost_frames = 0
-                    detector = AppearanceDetector(fps, frame_step)
-                    size_detector = OpeningSizeDetector(fps)
-                    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                    previous_window = None
-                    interval_jump = False
-                    _log(
-                        f"[{_format_elapsed(frame_index / fps)}] Otwór widoczny: "
-                        f"({opening.x:.1f}, {opening.y:.1f}); analiza.",
-                        flush=True,
-                    )
-                    continue
-
+        with csv_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
+            rows = csv.writer(csv_file, delimiter="\t")
+            rows.writerow(headers)
+            frame_index = 0
+            while frame_index < frame_count:
                 ok, frame = capture.read()
                 if not ok:
-                    break
+                    raise RuntimeError(
+                        f"Nie można odczytać klatki {frame_index} z {video_path}"
+                    )
 
-                tracked = track_opening(frame, reference_gray, opening)
-                lost_frames = (
-                    lost_frames + 1 if tracked.confidence < MIN_TRACK_CONFIDENCE else 0
-                )
-                current_window = _jump_window(frame, opening)
-                camera_jump = interval_jump or is_camera_jump(
-                    previous_window, current_window
-                )
-                previous_window = current_window
-                interval_jump = False
-                skip_sample = camera_jump and tracked.confidence >= MIN_TRACK_CONFIDENCE
-                if skip_sample:
-                    # Próbka z odświeżenia obrazu przez kamerę jest pomijana (nie
-                    # trafia do okna potwierdzania ani do tła); tło sprzed skoku
-                    # zostaje, a różnicę jasności wyrównuje _activity_mask.
-                    mask, bounds, changed_ratio = None, None, 0.0
-                else:
-                    mask, bounds, changed_ratio = _activity_mask(
-                        frame, reference_gray, opening, tracked, background
+                timestamp = recording_start + timedelta(seconds=frame_index / fps)
+                row: list[object] = [
+                    timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    f"{frame_index / fps:.3f}",
+                    frame_index,
+                ]
+                threshold_hit = False
+                try:
+                    measurement = _measure_opening_brightness(
+                        frame, offset_x, offset_y
                     )
-                regions: list[ActivityRegion] = []
-                largest_diagonal = 0.0
-                if mask is not None:
-                    regions, largest_diagonal = activity_regions(mask, min_diagonal_px)
-                    if background is not None and bounds is not None:
-                        _update_background(background, frame, bounds, mask, analyzed_fps)
-                appearance = (
-                    None if skip_sample else detector.update(frame_index, bool(regions))
-                )
-                if SIZE_DETECTOR_ENABLED and mask is not None:
-                    size_appearance = size_detector.update(
-                        frame_index, frame, tracked.x, tracked.y
-                    )
-                    recent_start = (
-                        appearances[-1].start_frame if appearances else None
-                    )
-                    if appearance is None and size_appearance is not None and (
-                        recent_start is None
-                        or frame_index - recent_start > fps * clip_seconds
+                except ValueError as error:
+                    invalid_rows += 1
+                    appearance = detector.update(frame_index, False)
+                    accepted_event = False
+                    if appearance is not None and (
+                        (mode == "all" or not appearances)
+                        and (
+                            not appearances
+                            or appearance.start_frame - appearances[-1].start_frame
+                            >= minimum_clip_gap
+                        )
                     ):
-                        appearance = size_appearance
-                if appearance is not None:
-                    appearances.append(appearance)
-                timestamp = frame_index / fps
-                rows.writerow(
-                    [
-                        f"{timestamp:.3f}",
-                        tracked.x,
-                        tracked.y,
-                        f"{tracked.confidence:.4f}",
-                        f"{changed_ratio:.5f}",
-                        f"{largest_diagonal:.2f}",
-                        len(regions),
-                        "wykryto" if appearance is not None else "",
-                    ]
-                )
-
-                annotated = frame.copy()
-                if tracked.confidence >= MIN_TRACK_CONFIDENCE and bounds is not None:
-                    x1, y1, x2, y2 = bounds
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 220, 255), 2)
-                    cv2.drawMarker(
-                        annotated,
-                        (tracked.x, tracked.y),
-                        (0, 255, 0),
-                        cv2.MARKER_CROSS,
-                        18,
-                        2,
-                    )
-                    for region in regions:
-                        top_left = (x1 + region.x, y1 + region.y)
-                        bottom_right = (
-                            top_left[0] + region.width,
-                            top_left[1] + region.height,
-                        )
-                        cv2.rectangle(annotated, top_left, bottom_right, (255, 80, 0), 2)
-                        cv2.putText(
-                            annotated,
-                            f"{region.diagonal:.0f}px",
-                            (top_left[0], max(20, top_left[1] - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            (255, 80, 0),
-                            2,
-                            cv2.LINE_AA,
-                        )
-                    state = (
-                        f"obszary {len(regions)} > {min_diagonal_px:.0f}px"
-                        f" / bok >= {MIN_REGION_SIDE_PX}px"
-                        f" / proporcje <= {MAX_REGION_ASPECT:g}:1"
-                        f" | zmiana {changed_ratio:.1%}"
+                        appearances.append(appearance)
+                        accepted_event = True
+                    row.extend([""] * 11)
+                    row.extend(
+                        [
+                            "0",
+                            "1" if appearance is not None else "0",
+                            "1" if accepted_event else "0",
+                            f"blad_geometrii: {error}",
+                        ]
                     )
                 else:
-                    state = "POMINIETO: slabe dopasowanie"
+                    valid_rows += 1
+                    threshold_hit = (
+                        measurement.difference_percent >= threshold_percent
+                    )
+                    threshold_hits += int(threshold_hit)
+                    appearance = detector.update(frame_index, threshold_hit)
+                    accepted_event = False
+                    if appearance is not None and (
+                        (mode == "all" or not appearances)
+                        and (
+                            not appearances
+                            or appearance.start_frame - appearances[-1].start_frame
+                            >= minimum_clip_gap
+                        )
+                    ):
+                        appearances.append(appearance)
+                        accepted_event = True
+                    row.extend(
+                        [
+                            f"{measurement.cross_x:.3f}",
+                            f"{measurement.cross_y:.3f}",
+                            measurement.test_x,
+                            measurement.test_y,
+                            measurement.reference_x,
+                            measurement.reference_y,
+                            f"{measurement.test_mean:.4f}",
+                            f"{measurement.reference_mean:.4f}",
+                            f"{measurement.signed_difference:.4f}",
+                            f"{measurement.absolute_difference:.4f}",
+                            f"{measurement.difference_percent:.4f}",
+                            "1" if threshold_hit else "0",
+                            "1" if appearance is not None else "0",
+                            "1" if accepted_event else "0",
+                            "ok",
+                        ]
+                    )
+                rows.writerow(row)
 
-                if appearance is not None:
-                    state += " | WYKRYTO"
-                cv2.putText(
-                    annotated,
-                    f"otwor {opening.x:.0f},{opening.y:.0f} | "
-                    f"sledzenie {tracked.confidence:.2f} | {state}",
-                    (24, 72),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.85,
-                    (0, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                if writer is not None:
-                    preview = cv2.resize(
-                        annotated, output_size, interpolation=cv2.INTER_AREA
-                    )
-                    writer.write(preview)
-                frame_index += frame_step
-                if appearance is not None and mode == "first":
-                    break
-                for _ in range(frame_step - 1):
-                    skipped_ok, skipped = capture.read()
-                    if not skipped_ok:
+                frame_index += 1
+                for _ in range(sample_step_frames - 1):
+                    if frame_index >= frame_count:
                         break
-                    skipped_window = _jump_window(skipped, opening)
-                    if is_camera_jump(previous_window, skipped_window):
-                        interval_jump = True
-                    previous_window = skipped_window
-                if appearance is not None:
-                    # Klip pokrywa następną minutę, więc analiza zaczyna się dopiero za nim.
-                    resume_frame = appearance.start_frame + int(round(fps * clip_seconds))
-                    if resume_frame > frame_index:
-                        frame_index = resume_frame
-                        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                        previous_window = None
-                        interval_jump = False
-                    detector = AppearanceDetector(fps, frame_step)
-                    size_detector.rearm()
-                if lost_frames >= lost_limit:
-                    _log(
-                        f"[{_format_elapsed(frame_index / fps)}] Otwór przestał być "
-                        "widoczny; czekam, aż się pojawi.",
-                        flush=True,
-                    )
-                    opening = None
+                    if not capture.grab():
+                        if frame_index >= frame_count - sample_step_frames:
+                            frame_index = frame_count
+                            break
+                        raise RuntimeError(
+                            f"Nie można odczytać klatek przed indeksem {frame_index} "
+                            f"z {video_path}"
+                        )
+                    frame_index += 1
     except (KeyboardInterrupt, SystemExit):
-        # Przerwana analiza nie zostawia niepełnych wyników.
         csv_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        csv_path.unlink(missing_ok=True)
         raise
     finally:
         capture.release()
-        if writer is not None:
-            writer.release()
-        if not save_preview:
-            # Pusty plik rezerwujący nazwę nie jest potrzebny bez podglądu.
-            output_path.unlink(missing_ok=True)
 
-    if last_opening is None:
-        output_path.unlink(missing_ok=True)
-        csv_path.unlink(missing_ok=True)
-        _log("Nie znaleziono widocznego otworu w całym nagraniu; brak wyników.")
-        return output_path
+    if valid_rows == 0:
+        raise RuntimeError(
+            f"Nie udało się zmierzyć pola jasności w żadnej klatce: {video_path}"
+        )
+    _log(
+        f"Jasność test/odniesienie: {csv_path}; próbki {valid_rows}, "
+        f"błędy geometrii {invalid_rows}, sygnały >= {threshold_percent:.1f}%: "
+        f"{threshold_hits}, potwierdzone klipy: {len(appearances)}."
+    )
+    return appearances, valid_rows, invalid_rows
 
+
+def _analyze_brightness_only(
+    video_path: Path,
+    output_path: Optional[Path],
+    mode: str,
+    clip_seconds: float,
+    threshold_percent: float,
+) -> Path:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Nie można otworzyć pliku: {video_path}")
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    finally:
+        capture.release()
+    if fps <= 0 or frame_count <= 0:
+        raise RuntimeError("Nie udało się odczytać parametrów nagrania.")
+
+    recording_start = _recording_start_time(video_path, frame_count / fps)
+    output_path = _timestamped_output_path(video_path, output_path, recording_start)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    brightness_csv_path = _reserve_output_path(
+        output_path.with_name(
+            f"{video_path.stem}_brightness_{recording_start:%Y%m%d%H%M%S}.csv"
+        )
+    )
+    appearances, _, _ = _analyze_brightness_video(
+        video_path,
+        brightness_csv_path,
+        fps,
+        frame_count,
+        recording_start,
+        threshold_percent,
+        clip_seconds,
+        mode=mode,
+    )
     clip_paths = _save_appearance_clips(
         video_path,
         output_path,
@@ -1043,27 +640,39 @@ def analyze_video(
         clip_seconds,
         recording_start,
     )
-    _log(
-        f"Ostatni otwór: ({last_opening.x:.1f}, {last_opening.y:.1f}), "
-        f"wynik: {last_opening.score:.1f}; "
-        f"doszedł do klatki {min(frame_index, frame_count)}/{frame_count} "
-        f"(analiza co {frame_step}. klatkę)."
-    )
-    if save_preview:
-        _log(f"Podgląd: {output_path}")
-    else:
-        output_path.unlink(missing_ok=True)
-    if save_preview or clip_paths:
-        _log(f"Wyniki CSV: {csv_path}")
-    else:
-        csv_path.unlink(missing_ok=True)
+    _log(f"Wyniki jasności: {brightness_csv_path}")
     if clip_paths:
-        _log("Zapisane klipy:")
+        _log("Zapisane klipy z progu jasności:")
         for clip_path in clip_paths:
             _log(f"  {clip_path}")
     else:
-        _log("Nie wykryto pojawienia się przekraczającego zadany próg.")
+        _log("Nie wykryto sygnału jasności >= zadanego progu.")
     return output_path
+
+
+def analyze_video(
+    video_path: Path,
+    output_path: Optional[Path] = None,
+    mode: str = "all",
+    clip_seconds: float = DEFAULT_CLIP_SECONDS,
+    brightness_threshold_percent: float = DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT,
+) -> Path:
+    if mode not in {"first", "all"}:
+        raise ValueError("Tryb musi mieć wartość 'first' albo 'all'.")
+    if not math.isfinite(clip_seconds) or clip_seconds <= 0:
+        raise ValueError("Długość klipu musi być dodatnią, skończoną wartością.")
+    if (
+        not math.isfinite(brightness_threshold_percent)
+        or brightness_threshold_percent < 0
+    ):
+        raise ValueError("Próg jasności musi być nieujemną, skończoną wartością.")
+    return _analyze_brightness_only(
+        video_path,
+        output_path,
+        mode,
+        clip_seconds,
+        brightness_threshold_percent,
+    )
 
 
 def _parse_clock(value: str) -> time:
@@ -1327,7 +936,7 @@ def _terminate(_signum: int, _frame: object) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Wykrywanie dużych zmian przy otworze i zapis klipów."
+        description="Pomiar jasności przy otworze i zapis klipów."
     )
     parser.add_argument(
         "video",
@@ -1380,21 +989,14 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Opcjonalna ścieżka bazowa podglądu MP4; domyślnie katalog analizy",
+        help="Opcjonalna ścieżka bazowa wyników; domyślnie katalog analizy",
     )
     parser.add_argument(
         "--mode",
         choices=("first", "all"),
         default="all",
-        help="all: analizuj cały film i zapisz wszystkie wykrycia (domyślnie); "
-        "first: zatrzymaj analizę po pierwszym wykryciu",
-    )
-    parser.add_argument(
-        "--min-diagonal-px",
-        type=float,
-        default=DEFAULT_MIN_DIAGONAL_PX,
-        help=f"Minimalna przekątna prostokąta zmiany w pikselach "
-        f"(domyślnie {DEFAULT_MIN_DIAGONAL_PX:g})",
+        help="all: zapisz wszystkie wykryte zdarzenia (domyślnie); "
+        "first: zapisz najwyżej pierwszy klip; oba tryby analizują cały film",
     )
     parser.add_argument(
         "--clip-seconds",
@@ -1404,17 +1006,11 @@ def main() -> None:
         f"(domyślnie {DEFAULT_CLIP_SECONDS:g})",
     )
     parser.add_argument(
-        "--frame-step",
-        type=int,
-        default=DEFAULT_FRAME_STEP,
-        help="Analizuj co N-tą klatkę (domyślnie "
-        f"{DEFAULT_FRAME_STEP}; 1 = każdą, wolniej)",
-    )
-    parser.add_argument(
-        "--save-preview",
-        action="store_true",
-        help="Zapisz też pełny podgląd MP4 z oznaczeniami i CSV, nawet bez wykrycia "
-        "(domyślnie powstają tylko klipy z wykryciem i ich CSV)",
+        "--brightness-threshold-percent",
+        type=float,
+        default=DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT,
+        help="Próg bezwzględnej różnicy jasności test–odniesienie w procentach "
+        f"(domyślnie {DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT:g})",
     )
     args = parser.parse_args()
 
@@ -1454,10 +1050,8 @@ def main() -> None:
                 video,
                 args.output,
                 mode=args.mode,
-                min_diagonal_px=args.min_diagonal_px,
                 clip_seconds=args.clip_seconds,
-                save_preview=args.save_preview,
-                frame_step=args.frame_step,
+                brightness_threshold_percent=args.brightness_threshold_percent,
             )
 
         from mcrwac.notify import build_service_notifier
@@ -1510,10 +1104,8 @@ def main() -> None:
                 video,
                 args.output,
                 mode=args.mode,
-                min_diagonal_px=args.min_diagonal_px,
                 clip_seconds=args.clip_seconds,
-                save_preview=args.save_preview,
-                frame_step=args.frame_step,
+                brightness_threshold_percent=args.brightness_threshold_percent,
             )
             if args.output is None and RECORDING_NAME_PATTERN.match(video.name):
                 _mark_analyzed(video, "ok")

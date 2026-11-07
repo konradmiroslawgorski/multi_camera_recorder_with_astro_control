@@ -1,91 +1,99 @@
 # Część techniczna: analiza wyjścia wiewiórki
 
-Uzupełnienie [README_SQUIRREL_ANALYSIS.md](README_SQUIRREL_ANALYSIS.md). Opisuje architekturę, stałe z uzasadnieniem, procedurę tworzenia wzorców, formaty plików i ograniczenia, tak aby rozwiązanie dało się odtworzyć od zera.
+Uzupełnienie [README_SQUIRREL_ANALYSIS.md](README_SQUIRREL_ANALYSIS.md).
+Analizator używa wyłącznie geometrii linii ścian i różnicy jasności dwóch
+prostokątów. Nie wyszukuje komina ani dachu, nie śledzi obiektu, nie wykrywa
+ruchu, nie odejmuje średniej jasności tła i nie pomija próbek z powodu skoku
+jasności kamery.
 
-## 1. Cel i założenia
+## 1. Przepływ i architektura
 
-- Kamera POE_BRAMA (2304×1296, 12 kl./s) nagrywa ścianę z małym otworem (ok. 10×15 px). Wiewiórka wychodzi z otworu.
-- Analiza jest **offline** (po nagraniu), nie wpływa na rejestrator. Wynik: klipy 1 min od wykrycia (analiza przeskakuje za klip), CSV, lista przeanalizowanych plików.
-- Wymagania: Python 3.10, `numpy`, `opencv-python`, `ffmpeg` w PATH (klipy), `pip install -r requirements.txt` do `venv_motion`.
-- Nagrania: `/opt/cameras/recordings/<KAMERA>/RRRR-MM-DD/GG-MM-SS.mkv` (czas startu w nazwie, segmenty ok. 30 min). Wyniki: `/opt/cameras/recordings/analysis/RRRR-MM-DD/POE_BRAMA_wiewiorki/`.
-- Kamera po restarcie zmienia położenie (25.10 otwór ≈ (999, 793); 26–27.10 ≈ (347, 744)), a światło zmienia się od pochmurnego po pełne słońce i błękitne niebo. Stąd lokalizacja otworu na każdym pliku, nie stałe współrzędne.
+1. Nagranie jest próbkowane raz na sekundę. Pomijane są wyłącznie klatki
+   pośrednie, których nie analizujemy; nie jest to filtr skoków kamery.
+2. Na każdej próbce `_measure_opening_brightness` szuka trzech krawędzi ścian
+   i z ich przecięć wyznacza środek krzyżyka.
+3. Program mierzy średnią jasność w polu testowym i polu odniesienia na
+   nieprzetworzonej klatce w skali szarości.
+4. Sygnał to bezwzględna różnica procentowa co najmniej 20%. `AppearanceDetector`
+   potwierdza zdarzenie, gdy sygnał wystąpi w co najmniej 2 z 4 kolejnych
+   próbek.
+5. Zdarzenie zapisuje klip od pierwszej próbki spełniającej próg oraz wiersze
+   pomiarów do tabulatorowego CSV. `--mode first` ogranicza liczbę klipów do
+   jednego, ale nadal analizuje całe nagranie.
 
-## 2. Architektura (`mcrwac/analysis/squirrel_exit_prototype.py`)
-
-Jeden moduł, bez stanu globalnego poza `lru_cache` wzorców.
-
-| Etap | Funkcje |
+| Etap | Funkcje i ustawienia |
 |---|---|
-| Wzorce | `AnchorSpec`, `CHIMNEY_ANCHOR`, `RIDGE_ANCHOR`, `REFERENCE_OPENING`, `_load_anchor_templates` (cache) |
-| Lokalizacja otworu | `_find_anchor`, `_opening_from_triangle`, `_probe_reference` (1 klatka), `locate_opening_by_triangle` (13 klatek), `_find_opening` (siatka + bisekcja) |
-| Śledzenie | `track_opening` (matchTemplate, okno ±32 px) |
-| Wykrywanie zmian | `AdaptiveBackground`, `_update_background`, `_activity_mask`, `activity_regions` |
-| Decyzja | `AppearanceDetector` (okno i liczba trafień) |
-| Wyniki | `_save_appearance_clips` (ffmpeg), CSV, `analyzed.txt` |
-| Sterowanie | `analyze_video`, `select_recordings`, `next_pending_recording`, `watch_recordings`, `main` |
-| Log | `_log` — `[hh:mm:ss]` zegarowy + `[GG-MM-SS-mmm]` czas w nagraniu |
+| Geometria | `_measure_opening_brightness`, `_fit_wall_line`, `_wall_intersection` |
+| Pomiar i sygnał | `_analyze_brightness_video`, `AppearanceDetector`, `BRIGHTNESS_SAMPLE_SECONDS=1`, `CONFIRM_WINDOW_SAMPLES=4`, `CONFIRM_HITS=2` |
+| Klipy i wyniki | `_save_appearance_clips`, `_analyze_brightness_only`, `analyze_video` |
+| Kolejka nagrań | `select_recordings`, `next_pending_recording`, `watch_recordings`, `main` |
 
-Przepływ `analyze_video`: odczyt metadanych → `_find_opening` → pętla klatek (co `--frame-step`-ta, reszta `grab()`) → `track_opening` → `_activity_mask` → `activity_regions` → `AppearanceDetector` → przy wykryciu zapis klipu (tryb `first` kończy, `all` kontynuuje po zwolnieniu) → jeśli otwór zniknie na `LOST_TRACKING_SECONDS`, ponowne `_find_opening` od bieżącej pozycji.
+## 2. Linie i prostokąty
 
-## 3. Lokalizacja otworu
+W każdej klatce algorytm szuka:
 
-1. **Kotwice.** Dwa wycinki pierwszej klatki `11-52-43.mkv` (`reference/poe_brama_chimney.png`: origin (150, 485), punkt (183, 526) = lewa krawędź komina; `poe_brama_ridge.png`: origin (610, 515), punkt (666, 555) = szczyt dachu), opis w `AnchorSpec`. Otwór wzorca: `REFERENCE_OPENING` = (347, 744).
-2. Dopasowanie: mapa krawędzi (CLAHE, rozmycie, Sobel; płaskie obszary dostają deterministyczny szum), `matchTemplate` w skalach `ANCHOR_SCALES`. Akceptacja: wynik obu kotwic ≥ 0,58, skala 0,85–1,18, obrót ≤ 15°. Otwór = A' + skala·R·(O − A), gdzie A to komin, O otwór.
-3. **Pełne potwierdzenie**: 13 klatek (`locate_opening_by_triangle`), ≥ 2 estymaty, mediana, rozrzut ≤ 12 px.
-4. **`_find_opening`**: klatka 0 → jeśli OK, potwierdzenie i analiza od razu. Jeśli nie: siatka co 60 s (1 klatka na punkt), po pierwszym trafieniu bisekcja wstecz do dokładności 15 s, potem potwierdzenie. Gdy w całym pozostałym fragmencie brak trójkąta — plik kończy bez wyników.
-5. Koszt: klatka ok. 1,5 s; wyszukanie ok. 32 s przy otworze widocznym od początku, 97 s przy trójkącie widocznym od 1500 s.
+- czerwonej, pionowej krawędzi narożnika: 10 próbek w zakresie Y=680–825 px,
+  kandydaci X=346–368 px;
+- niebieskiej, poziomej granicy po lewej: 10 próbek w X=278–340 px,
+  kandydaci Y=738–775 px;
+- żółtej granicy po prawej: po 5 próbek w zakresach X=362–386 i X=442–458 px,
+  z lokalnym zakresem wyszukiwania wokół przewidywanej linii.
 
-### Jak odtworzyć kotwice (nowa pozycja kamery / widok)
-1. Wyciągnij klatkę, np. `ffmpeg -ss 0 -i plik.mkv -frames:v 1 f.png`.
-2. Wytnij małe wycinki (szare PNG) wokół lewej krawędzi komina i szczytu dachu, z tłem nieba.
-3. Zapisz w `mcrwac/analysis/reference/`, ustaw w `AnchorSpec` `origin` wycinka i `anchor` (punkt w pełnej klatce) oraz `REFERENCE_OPENING`.
-4. Sprawdź na kilku momentach pliku (0/60/300/900/1700 s), czy pozycja jest stabilna.
+Każda krawędź wymaga co najmniej 5 punktów o gradiencie co najmniej 8. Dopasowanie
+wykorzystuje konsensus par punktów do odrzucenia odstających kandydatów, a
+następnie dopasowanie najmniejszych kwadratów. Rozrzut dopasowania nie może
+przekroczyć 3 px. Środek krzyżyka jest średnią przecięć czerwonej linii z
+niebieską i żółtą; jeśli przecięcia różnią się o ponad 20 px, pomiar jest
+odrzucany.
 
-## 4. Wykrywanie wiewiórki
+Pole testowe ma 10×17 px i lewy górny róg `(X−12, Y−19)`. Pole odniesienia ma
+ten sam rozmiar, zaczyna się 2 px w lewo i znajduje się 5 pustych rzędów nad
+pole testowym. Wartości jasności są średnimi pikseli po konwersji do skali
+szarości. Nie ma rozmycia, odejmowania mediany ani adaptacyjnego tła.
 
-- **Śledzenie**: szablon 96×96 px (`TEMPLATE_RADIUS = 48`) z klatki wzorca, `TM_CCOEFF_NORMED`, szukanie ±32 px; pewność < 0,6 → klatka pomijana; brak otworu przez 15 s → ponowne szukanie.
-- **ROI**: ±16 px poziomo, 24 px w górę, 24 px w dół (32×48 px) od otworu.
-- **Tło adaptacyjne**: start z wzorca; `accumulateWeighted` α = 0,01; piksele zmienione są zamrożone do 30 s, dłuższa zmiana (światło) wchodzi do tła.
-- **Maska**: od różnicy odjęta mediana (globalna ekspozycja); piksel aktywny, gdy `tło − obraz > 25` **i** `obraz < tło × 0,65`; rozmycie 3×3, otwarcie morfologiczne 3×3.
-- **Regiony**: przekątna > 14 px, krótszy bok ≥ 5 px, proporcje ≤ 6.
-- **Decyzja**: przy `--frame-step 1` okno 5 klatek / 3 trafienia; przy kroku > 1 okno 3 / 2 trafienia; zwolnienie po przerwie 1,5 s.
-- Domyślnie `--frame-step 12` (≈ 1 próbka na sekundę, okno 4 próbek / 2 trafienia): wiewiórka na ścianie porusza się bardzo wolno, a krótkie przeloty (wrony) nie są celem.
+Współrzędne pasm są skalibrowane dla widoku POE_BRAMA. Duże przesunięcie kamery
+może spowodować błąd geometrii, który trafia do kolumny `status` CSV. W takim
+przypadku próbka pozostaje w raporcie i nie wyzwala sygnału.
 
-## 5. Uzasadnienia i historia strojenia
+## 3. Sygnał i CSV
 
-| Stała | Wartość | Dlaczego |
-|---|---|---|
-| `MIN_DARKENING_RATIO` | 0,65 | Fałszywy alarm w 14-30-24 (zmiana tła/cień od słońca): obraz tylko nieco ciemniejszy. Prawdziwa wiewiórka: region ok. 15×27–16×31 px, 95–99% pikseli < 60. Dla 0,6 wykrycie spóźnione (51,2 s zamiast 45,7 s); 0,7 daje 0 fałszywych; 0,75 → 81, 0,8 → 216 fałszywych regionów |
-| `DEFAULT_MIN_DIAGONAL_PX` | 30 | Odsiewa szum i drobne cienie; prawdziwa wiewiórka ma ok. 31–35 px |
-| `DEFAULT_CLIP_SECONDS` | 60 | klip i jednocześnie przeskok analizy po wykryciu |
-| `SEARCH_GRID_SECONDS` | 60 | Kompromis szybkość/ryzyko pominięcia okien widoczności < 60 s |
-| `SEARCH_RETRY_SECONDS` | 15 | Dokładność bisekcji |
-| `ANCHOR_MIN_SCORE` | 0,58 | Fałszywe trafienia nocą miały 0,53–0,57; dodatkowo odrzuca je geometria |
-| `WATCH_SETTLE_SECONDS` | 120 | Plik uznany za zakończony, gdy brak zapisu 120 s lub jest nowszy segment |
+`DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT=20`. Dla poprawnego pomiaru sygnał
+przekracza próg, gdy:
 
-Pomiary (VM, 2 rdzenie, obciążona): odczyt sekwencyjny 70 kl./s; plik 30 min — pętla analizy ok. 5 min, reszta to ffmpeg klipów; pełny przebieg z 4 klipami 17,7 min (1065 s zegarowo, 760 s CPU).
+```text
+abs(test_mean - reference_mean) / reference_mean * 100 >= próg
+```
 
-Pliki kontrolne: `2026-10-25/05-49-02-18-19.mkv` (klip, wiewiórka ok. 45,7 s), `13-00-08.mkv` (wiewiórka wraca do dziury — wykrywana), `2026-10-26/14-30-24.mkv` (słońce, brak wiewiórki — nie może być wykrycia), `2026-10-27/09-22-43.mkv` (jasno, błękitne niebo — otwór (347, 744)).
+Wartość bezwzględna oznacza, że rozjaśnienie i przyciemnienie są traktowane
+tak samo. Próbki z niepoprawną geometrią są liczone jako brak sygnału, ale nie
+przerywają analizy filmu.
 
-## 6. Formaty plików
+CSV jest kodowany jako UTF-8 z BOM-em i rozdzielany tabulatorami. Zawiera jeden
+wiersz na sekundę, czas i numer klatki źródłowej, współrzędne krzyżyka i pól,
+średnie jasności, różnicę ze znakiem i bezwzględną, różnicę procentową, sygnał
+progu, potwierdzenie zdarzenia, początek klipu oraz status geometrii.
 
-- Klip: `<stem>_<RRRRMMDDGGMMSS>.mkv` (czas wykrycia); przy kolizji sufiks `_02`, `_03`… Klip tworzony `ffmpeg` (libx264 veryfast, crf 20, aac), start = klatka wykrycia, długość ≤ `--clip-seconds`.
-- CSV (tylko przy wykryciu lub `--save-preview`): zdarzenia z czasem w nagraniu; podgląd MP4 tylko z `--save-preview`.
-- `analyzed.txt` w katalogu dnia: linie `nazwa<TAB>ok|blad`. Plik bez otworu też jest `ok`. Przerwana analiza kasuje częściowe CSV/MP4 i nie wpisuje do listy.
+Klipy domyślnie trwają 60 sekund. Nakładające się zdarzenia nie tworzą
+powielonych klipów. Materiał wideo jest kodowany przez ffmpeg (H.264, audio
+AAC), a nazwa zawiera czas początku zdarzenia.
 
-## 7. Tryb `--watch` i usługa
+## 4. Kolejka i usługa
 
-`next_pending_recording` wybiera najstarszy nieprzeanalizowany plik z dnia startu i kolejnych (nie starsze; do tego `--date`). `watch_recordings` odpytuje co `--poll-seconds` (30), uruchamia analizę z `nice` 10; SIGTERM (`_terminate`) kończy czysto. `--hours` działa też z `--watch`. Usługa: `systemd/squirrel-analysis.service` (Nice=10, IOSchedulingClass=idle), kopiowana do `/etc/systemd/system/`, `systemctl enable --now squirrel-analysis`.
+Tryb `--watch` wybiera zakończone, nieprzeanalizowane nagrania, czeka 120 s na
+zamknięcie aktualnie zapisywanego segmentu i nadrabia zaległości po restarcie.
+Wpisy statusu trafiają do `analysis/RRRR-MM-DD/POE_BRAMA_wiewiorki/analyzed.txt`.
+Jednostka systemd to `systemd/squirrel-analysis.service`; instrukcje startu,
+statusu i logów są w głównym README.
 
-## 8. Testy
+## 5. Testy i ograniczenia
 
-`./venv_motion/bin/python -m unittest tests.test_squirrel_exit_prototype tests.test_notifier tests.test_time_window` — 26 testów analizy (lokalizacja, śledzenie, filtry, detektor, ścieżki, `_find_opening`, tło, `select_recordings`, watch).
+Testy:
 
-## 9. Znane ograniczenia i pomysły
+```bash
+./venv_motion/bin/python -m unittest tests.test_squirrel_exit_prototype tests.test_notifier tests.test_time_window
+```
 
-- Brak planu B: gdy komin lub szczyt dachu są poza kadrem, zasłonięte lub kamera obrócona o > 15°, otworu nie znajdzie. Wzorce pochodzą z jednego dnia (`11-52-43`); inne pory sprawdzono tylko częściowo.
-- Nocą komin widać późno (`05-22-27`: od ok. 1500 s); obniżenie `ANCHOR_MIN_SCORE` do ok. 0,55 dałoby wcześniejsze wykrycie (nie sprawdzono).
-- Okna widoczności otworu krótsze niż 60 s mogą zostać pominięte; bardzo jasna wiewiórka na jasnym tle byłaby pominięta.
-- Krok 12 gubi przeloty < ok. 2 s; `--frame-step 1` łapie więcej zdarzeń granicznych.
-- `--watch` nie obejmuje starszych dni; pomysł: `--since RRRR-MM-DD`.
-- Pomysły: powiadomienie ntfy po wykryciu, automatyczne tworzenie wzorców, wnioskowanie o oświetleniu zamiast stałej 0,65.
+Zmiana jasności jest sygnałem do utworzenia klipu, nie klasyfikacją gatunku.
+Słońce, cień, ruch kamery lub obiekt w polu odniesienia również mogą przekroczyć
+próg. Po zmianie kadru należy ponownie skalibrować ograniczone pasma wyszukiwania
+linii.

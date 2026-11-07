@@ -11,224 +11,97 @@ import cv2
 import numpy as np
 
 from mcrwac.analysis.squirrel_exit_prototype import (
-    ActivityRegion,
     Appearance,
     AppearanceDetector,
-    OpeningCandidate,
-    REFERENCE_DIR,
-    TrackResult,
-    _activity_mask,
-    _find_opening,
-    _format_elapsed,
+    _fit_wall_line,
     _analyzed_list_path,
     _load_analyzed,
-    _load_anchor_templates,
     _mark_analyzed,
+    _measure_opening_brightness,
     _recording_start_time,
-    _reference_window,
     _reserve_output_path,
     _save_appearance_clips,
     _timestamped_output_path,
-    _update_background,
-    OpeningSizeDetector,
-    activity_regions,
+    analyze_video,
     build_day_result,
     update_day_results,
-    locate_opening_by_triangle,
     next_pending_recording,
     select_recordings,
-    track_opening,
     watch_recordings,
 )
 
 
-def _scene() -> np.ndarray:
-    frame = np.full((300, 300, 3), 180, dtype=np.uint8)
-    cv2.rectangle(frame, (105, 35), (155, 265), (120, 120, 120), -1)
-    cv2.line(frame, (30, 145), (250, 145), (230, 230, 230), 3)
-    cv2.ellipse(frame, (132, 150), (2, 4), 0, 0, 360, (5, 5, 5), -1)
-    return frame
-
-
 class SquirrelExitPrototypeTests(unittest.TestCase):
-    def test_tracks_opening_after_small_camera_translation(self) -> None:
-        reference = _scene()
-        reference_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
-        transform = np.float32([[1, 0, 3], [0, 1, 2]])
-        shifted = cv2.warpAffine(reference, transform, (300, 300))
-        opening = OpeningCandidate(132, 150, 1.0)
+    def test_analysis_uses_only_brightness_measurements(self) -> None:
+        video_path = Path("recording.mkv")
+        expected_output = Path("analysis.mp4")
 
-        tracked = track_opening(shifted, reference_gray, opening)
-        mask, bounds, change_ratio = _activity_mask(
-            shifted, reference_gray, opening, tracked
-        )
+        with patch(
+            "mcrwac.analysis.squirrel_exit_prototype._analyze_brightness_only",
+            return_value=expected_output,
+        ) as analyze_brightness_only:
+            result = analyze_video(video_path)
 
-        self.assertAlmostEqual(tracked.x, 135, delta=1)
-        self.assertAlmostEqual(tracked.y, 152, delta=1)
-        self.assertGreaterEqual(tracked.confidence, 0.60)
-        self.assertIsNotNone(mask)
-        self.assertIsNotNone(bounds)
-        self.assertLess(change_ratio, 0.02)
+        self.assertEqual(result, expected_output)
+        analyze_brightness_only.assert_called_once()
+        self.assertEqual(analyze_brightness_only.call_args.args[0], video_path)
+        self.assertEqual(analyze_brightness_only.call_args.args[2], "all")
+        self.assertEqual(analyze_brightness_only.call_args.args[3], 60.0)
+        self.assertEqual(analyze_brightness_only.call_args.args[4], 20.0)
 
-    def test_background_absorbs_slow_light_change_but_not_sudden_object(self) -> None:
-        frame = _scene()
-        reference_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        opening = OpeningCandidate(132, 150, 1.0)
-        tracked = TrackResult(132, 150, 1.0)
+    def test_wall_line_brightness_uses_test_and_reference_rectangles(self) -> None:
+        frame = np.full((1296, 2304, 3), 100, dtype=np.uint8)
+        cv2.line(frame, (355, 680), (346, 825), (220, 220, 220), 2)
+        cv2.line(frame, (278, 752), (340, 752), (20, 20, 20), 2)
+        cv2.line(frame, (362, 756), (458, 809), (20, 20, 20), 2)
 
-        # Lokalne przyciemnienie jasnej ściany (cień) nie jest wiewiórką.
-        shadow = frame.copy()
-        shadow[130:170, 136:148] = (shadow[130:170, 136:148] * 0.8).astype(np.uint8)
-        mask, _, _ = _activity_mask(shadow, reference_gray, opening, tracked)
-        self.assertEqual(cv2.countNonZero(mask), 0)
+        baseline = _measure_opening_brightness(frame)
+        self.assertAlmostEqual(baseline.test_mean, 100.0)
+        self.assertAlmostEqual(baseline.reference_mean, 100.0)
+        self.assertAlmostEqual(baseline.difference_percent, 0.0)
 
-        # Ciemny obiekt tej samej wielkości musi być widoczny.
-        dark = frame.copy()
-        dark[130:170, 136:148] = (20, 20, 20)
-        mask, _, _ = _activity_mask(dark, reference_gray, opening, tracked)
-        self.assertGreater(cv2.countNonZero(mask), 300)
+        dark_test = frame.copy()
+        dark_test[
+            baseline.test_y : baseline.test_y + 17,
+            baseline.test_x : baseline.test_x + 10,
+        ] = 50
+        measurement = _measure_opening_brightness(dark_test)
+        self.assertAlmostEqual(measurement.test_mean, 50.0)
+        self.assertAlmostEqual(measurement.reference_mean, 100.0)
+        self.assertAlmostEqual(measurement.difference_percent, 50.0)
 
-    def _roof_frame(self, shift=(0, 0)) -> np.ndarray:
-        """Klatka z szumem, na której wklejono komin i szczyt dachu ze wzorców."""
-        rng = np.random.default_rng(1)
-        gray = rng.integers(90, 130, (1296, 2304), dtype=np.uint8)
-        for name, (x, y) in (
-            ("poe_brama_chimney.png", (150, 485)),
-            ("poe_brama_ridge.png", (610, 515)),
-        ):
-            patch = cv2.imread(str(REFERENCE_DIR / name), cv2.IMREAD_GRAYSCALE)
-            h, w = patch.shape
-            gray[y + shift[1]:y + shift[1] + h, x + shift[0]:x + shift[0] + w] = patch
-        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        transform = np.float32([[1, 0, 20], [0, 1, 15]])
+        shifted = cv2.warpAffine(frame, transform, (2304, 1296))
+        translated = _measure_opening_brightness(shifted, offset_x=20, offset_y=15)
+        self.assertAlmostEqual(translated.cross_x, baseline.cross_x + 20, delta=0.1)
+        self.assertAlmostEqual(translated.cross_y, baseline.cross_y + 15, delta=0.1)
 
-    def test_loads_both_anchor_templates(self) -> None:
-        templates = _load_anchor_templates()
+    def test_wall_line_fit_ignores_two_bad_candidates(self) -> None:
+        points = [
+            (278, 755),
+            (285, 755),
+            (292, 755),
+            (299, 755),
+            (306, 755),
+            (312, 755),
+            (319, 755),
+            (326, 745),
+            (333, 739),
+            (340, 754),
+        ]
 
-        self.assertIsNotNone(templates)
-        for template in templates:
-            self.assertGreater(len(template.scaled), 5)
+        slope, intercept, residual = _fit_wall_line(points)
 
-    def test_triangle_gives_reference_opening_and_follows_camera_shift(self) -> None:
-        opening = locate_opening_by_triangle([self._roof_frame()], min_estimates=1)
-        shifted = locate_opening_by_triangle(
-            [self._roof_frame((120, -40))], min_estimates=1
-        )
+        self.assertAlmostEqual(slope * 309 + intercept, 755.0, delta=1.0)
+        self.assertLess(residual, 1.0)
 
-        self.assertAlmostEqual(opening.x, 347, delta=2)
-        self.assertAlmostEqual(opening.y, 744, delta=2)
-        self.assertAlmostEqual(shifted.x, 467, delta=2)
-        self.assertAlmostEqual(shifted.y, 704, delta=2)
+    def test_wall_line_brightness_rejects_missing_edges(self) -> None:
+        frame = np.full((1296, 2304, 3), 100, dtype=np.uint8)
 
-    def test_triangle_rejects_frame_without_chimney_and_ridge(self) -> None:
-        rng = np.random.default_rng(2)
-        gray = rng.integers(90, 130, (1296, 2304), dtype=np.uint8)
-        frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        with self.assertRaisesRegex(ValueError, "słaby kontrast"):
+            _measure_opening_brightness(frame)
 
-        self.assertIsNone(locate_opening_by_triangle([frame]))
-
-    def test_background_slow_change_scenario(self) -> None:
-        reference = _scene()
-        reference_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
-        opening = OpeningCandidate(132, 150, 1.0)
-        background = _reference_window(reference_gray, opening)
-        tracked = TrackResult(132, 150, 1.0)
-        self.assertIsNotNone(background)
-
-        # Powolne rozjaśnianie nie może wywołać alarmu, mimo +40 względem wzorca.
-        for step in range(1, 401):
-            frame = cv2.convertScaleAbs(reference, alpha=1.0, beta=step * 0.1)
-            mask, bounds, _ = _activity_mask(
-                frame, reference_gray, opening, tracked, background
-            )
-            if step > 100:
-                self.assertEqual(cv2.countNonZero(mask), 0, f"krok {step}")
-            _update_background(background, frame, bounds, mask, 12.0)
-
-        # Nagły ciemny obiekt musi nadal być widoczny.
-        frame = cv2.convertScaleAbs(reference, alpha=1.0, beta=40)
-        cv2.rectangle(frame, (125, 120), (142, 152), (20, 20, 20), -1)
-        mask, _, _ = _activity_mask(frame, reference_gray, opening, tracked, background)
-        regions, _ = activity_regions(mask, 30.0)
-        self.assertEqual(len(regions), 1)
-
-    def test_activity_regions_filter_by_bounding_box_diagonal(self) -> None:
-        mask = np.zeros((100, 100), dtype=np.uint8)
-        cv2.rectangle(mask, (5, 5), (15, 15), 255, -1)
-        cv2.rectangle(mask, (40, 20), (75, 40), 255, -1)
-
-        regions, largest_diagonal = activity_regions(mask, min_diagonal_px=25)
-
-        self.assertEqual(len(regions), 1)
-        self.assertGreater(regions[0].diagonal, 25)
-        self.assertAlmostEqual(largest_diagonal, regions[0].diagonal)
-        self.assertEqual(regions[0], ActivityRegion(40, 20, 36, 21, regions[0].diagonal))
-
-    def test_activity_regions_reject_thin_vibration_with_large_diagonal(self) -> None:
-        mask = np.zeros((100, 100), dtype=np.uint8)
-        cv2.rectangle(mask, (10, 10), (12, 50), 255, -1)
-        cv2.rectangle(mask, (20, 10), (28, 38), 255, -1)
-        cv2.rectangle(mask, (40, 20), (55, 50), 255, -1)
-
-        regions, largest_diagonal = activity_regions(mask, min_diagonal_px=30, min_side_px=12)
-
-        self.assertEqual(len(regions), 1)
-        self.assertEqual((regions[0].width, regions[0].height), (16, 31))
-        self.assertGreater(largest_diagonal, regions[0].diagonal)
-
-    def _run_find_opening(self, visible_from, frame_count=1000, visible_until=None):
-        """Otwór widoczny w klatkach [visible_from, visible_until)."""
-        frame = _scene()
-        opening = OpeningCandidate(132, 150, 13)
-        probes: list[int] = []
-
-        def probe(capture, index):
-            probes.append(index)
-            return visible_from <= index < (visible_until or frame_count + 1)
-
-        with patch("mcrwac.analysis.squirrel_exit_prototype._probe_reference", side_effect=probe), patch(
-            "mcrwac.analysis.squirrel_exit_prototype._sample_calibration_frames",
-            side_effect=lambda capture, fps, start: [frame],
-        ), patch(
-            "mcrwac.analysis.squirrel_exit_prototype.locate_opening_by_triangle",
-            return_value=opening,
-        ):
-            found = _find_opening(
-                capture=None, fps=10, frame_count=frame_count, start_frame=0, retry_frames=150
-            )
-        return found, probes
-
-    def test_find_opening_uses_grid_then_bisection_to_find_first_visible_moment(self) -> None:
-        found, probes = self._run_find_opening(visible_from=1700, frame_count=3000)
-
-        self.assertIsNotNone(found)
-        self.assertGreaterEqual(found[2], 1700)
-        self.assertLess(found[2], 1700 + 150)
-        # siatka co 600 klatek (60 s) i kilka kroków bisekcji, nie próba co 150
-        self.assertLess(len(probes), 12)
-
-    def test_find_opening_visible_at_start_needs_one_probe(self) -> None:
-        found, probes = self._run_find_opening(visible_from=0)
-
-        self.assertEqual(found[2], 0)
-        self.assertEqual(probes, [0])
-
-    def test_find_opening_returns_none_when_it_never_becomes_visible(self) -> None:
-        found, probes = self._run_find_opening(visible_from=10**9)
-
-        self.assertIsNone(found)
-        self.assertEqual(probes, [0, 600])
-
-    def test_activity_regions_reject_long_edge_like_regions(self) -> None:
-        mask = np.zeros((200, 100), dtype=np.uint8)
-        cv2.rectangle(mask, (10, 10), (22, 141), 255, -1)
-        cv2.rectangle(mask, (40, 20), (55, 50), 255, -1)
-
-        regions, _ = activity_regions(mask, min_diagonal_px=30)
-
-        self.assertEqual(len(regions), 1)
-        self.assertEqual((regions[0].width, regions[0].height), (16, 31))
-
-    def test_appearance_detector_confirms_a_persistent_large_region_once(self) -> None:
+    def test_appearance_detector_confirms_two_of_four_samples_once(self) -> None:
         detector = AppearanceDetector(fps=10)
         results = [
             detector.update(index, detected)
@@ -242,7 +115,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         self.assertEqual(appearances, [Appearance(start_frame=1)])
 
     def test_sparse_sampling_confirms_with_two_of_four_samples(self) -> None:
-        detector = AppearanceDetector(fps=12, frame_step=4)
+        detector = AppearanceDetector(fps=12)
         results = [
             detector.update(index * 4, detected)
             for index, detected in enumerate([False, True, True, False])
@@ -253,7 +126,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         )
 
     def test_sparse_sampling_counts_hits_across_four_samples(self) -> None:
-        detector = AppearanceDetector(fps=12, frame_step=12)
+        detector = AppearanceDetector(fps=12)
         results = [
             detector.update(index * 12, detected)
             for index, detected in enumerate([True, False, False, True])
@@ -442,44 +315,6 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             ).stdout)
             self.assertGreater(duration, 1.8)
 
-    def test_size_detector_flags_slowly_enlarged_opening_once(self) -> None:
-        rng = np.random.default_rng(0)
-        detector = OpeningSizeDetector(fps=10.0)
-        wall = np.full((300, 300, 3), 170, dtype=np.uint8)
-
-        def frame(squirrel: bool) -> np.ndarray:
-            image = wall.copy()
-            image += rng.integers(0, 3, image.shape, dtype=np.uint8)
-            if squirrel:
-                cv2.rectangle(image, (140, 140), (160, 168), (20, 20, 20), -1)
-            return image
-
-        results = []
-        for second in range(0, 200, 10):
-            results.append(
-                detector.update(second * 10, frame(100 <= second < 150), 150, 150)
-            )
-        starts = [item.start_frame for item in results if item is not None]
-        self.assertEqual(starts, [1000])
-
-    def test_size_detector_ignores_long_lasting_change(self) -> None:
-        rng = np.random.default_rng(1)
-        detector = OpeningSizeDetector(fps=10.0)
-        wall = np.full((300, 300, 3), 170, dtype=np.uint8)
-
-        def frame(dark: bool) -> np.ndarray:
-            image = wall.copy()
-            image += rng.integers(0, 3, image.shape, dtype=np.uint8)
-            if dark:
-                cv2.rectangle(image, (140, 140), (160, 168), (20, 20, 20), -1)
-            return image
-
-        results = [
-            detector.update(second * 10, frame(100 <= second < 400), 150, 150)
-            for second in range(0, 600, 10)
-        ]
-        self.assertEqual([item for item in results if item is not None], [])
-
     def test_next_pending_respects_hours_range(self) -> None:
         now = 1_800_000_000.0
         with TemporaryDirectory() as directory:
@@ -553,8 +388,6 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             [path.name for path in between], ["13-00-08.mkv", "16-30-00.mkv"]
         )
 
-    def test_elapsed_time_filename_is_zero_padded(self) -> None:
-        self.assertEqual(_format_elapsed(3723.125), "01-02-03-125")
 
 
 if __name__ == "__main__":

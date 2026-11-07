@@ -2,90 +2,36 @@
 
 Część techniczna: [README_SQUIRREL_ANALYSIS_TECH.md](README_SQUIRREL_ANALYSIS_TECH.md). Ogólny opis projektu: [README.md](README.md).
 
-Prototyp w `mcrwac/analysis/squirrel_exit_prototype.py` offline'owo analizuje
-nagrania kamery `POE_BRAMA` i wykrywa moment, gdy z małego otworu w ścianie
-wygląda wiewiórka. Nie wysyła alarmów i nie jest podłączony do usług
-nagrywających. Wiewiórka nie jest rozpoznawana jako gatunek: program wykrywa
-**dużą, ciemną zmianę obrazu tuż przy otworze**.
+Analizator w `mcrwac/analysis/squirrel_exit_prototype.py` przetwarza nagrania
+kamery `POE_BRAMA` offline. Nie wysyła alarmów i nie jest podłączony do usług
+nagrywających. Klipy wyzwala wyłącznie różnica jasności między dwoma małymi
+polami przy otworze. Nie ma detekcji ruchu ani wyszukiwania komina lub dachu.
 
 ### Algorytm krok po kroku
 
-Poniższe wartości (piksele dla nagrań 2304×1296, 12 kl./s) są stałymi na górze
-pliku prototypu.
-
-1. **Szukanie otworu (trójkąt podobny).** Program nie szuka samego otworu, bo
-   jest mały i bywa niewidoczny (słońce, mgła, noc). Zamiast tego znajduje dwa
-   punkty, które zawsze są widoczne na tle nieba: **lewą krawędź komina** i
-   **szczyt dachu**. Ich wzorce (małe wycinki krawędzi, nie jasności) leżą w
-   [`mcrwac/analysis/reference/`](mcrwac/analysis/reference/):
-   `poe_brama_chimney.png` i `poe_brama_ridge.png`. Cień na ścianie ani drzewa
-   ich nie zasłaniają, więc metoda działa przy każdym oświetleniu. Wzorce są
-   dopasowywane do całej klatki w skalach 0,85–1,18. Odległość i kąt między
-   znalezionymi punktami dają skalę i obrót względem wzorca, a otwór jest
-   **trzecim wierzchołkiem trójkąta podobnego** (komin–szczyt–otwór) ze wzorca,
-   przeniesionego na bieżącą klatkę; nie musi być widoczny. Warunki: wynik
-   dopasowania każdego z dwóch punktów ≥ 0,58, skala trójkąta 0,85–1,18, obrót
-   do 15°, wynik w kadrze. Z klatek próbkowanych co 0,25 s przez 3 s (13 klatek)
-   wynik jest przyjęty, gdy powstaje w co najmniej połowie klatek (rozrzut do
-   12 px). Działa także po restarcie lub przesunięciu kamery. Uwaga: wzorce
-   pochodzą z `11-52-43.mkv` (klatka 0, otwór ≈ (347, 744)) i są dopasowane do
-   widoku kamery `POE_BRAMA`.
-2. **Komin lub szczyt niewidoczny — szukanie siatką i bisekcją.** Przy
-   ciemności lub mgle (np. nocą komin widać dopiero pod koniec nagrania) program
-   nie kończy się błędem. Zamiast sprawdzać film co 15 s sprawdza **jedną
-   klatkę co 60 s** (ok. 1,5 s na klatkę). Po pierwszej udanej klatce wykonuje
-   **bisekcję** między nią a ostatnią klatką bez trójkąta, do dokładności 15 s,
-   i potwierdza wynik krokiem 1 (13 klatek). Analiza rusza od tego momentu, więc
-   nie traci początku. Gdy nie znajdzie trójkąta w całym pozostałym fragmencie,
-   kończy plik bez wyników. Założenie: punkty są widoczne od jednego momentu w
-   danym przedziale 60 s; krótsze okna widoczności mogą zostać pominięte.
-3. **Śledzenie.** Dla każdej analizowanej klatki program dopasowuje wzorzec otoczenia otworu
-   (`matchTemplate`, okno ±48 px, szukanie ±32 px) i koryguje położenie, więc
-   drobne ruchy kamery nie przeszkadzają. Klatki o pewności < 0,60 są pomijane.
-   Po ok. 15 s takich klatek otwór uznaje się za utracony i program wraca do
-   kroku 1, szukając od miejsca utraty, aż komin i szczyt dachu będą znowu
-   widoczne.
-5. **Tło.** Obszar analizy to okno wokół otworu: ±16 px w poziomie, 24 px w górę
-   i 24 px w dół. Jego tło startuje z klatki odniesienia i jest powoli
-   aktualizowane (współczynnik 0,01), więc zmiany oświetlenia nie dają alarmu.
-   Piksele, w których wykryto zmianę, są zamrożone (wiewiórka nie wtapia się w
-   tło), ale zmiana trwająca ponad 30 s uchodzi za trwałą i trafia do tła.
-6. **Maska zmiany.** Od tła odejmowana jest globalna zmiana ekspozycji (mediana
-   różnicy), po czym liczy się **tylko to, co wyraźnie ciemniejsze od tła**:
-   piksel musi być ciemniejszy o ponad 25 poziomów jasności **i** mieć mniej niż
-   65% jasności tła. Drugi warunek odrzuca cienie, zmiany słońca i ekspozycji,
-   które tylko nieco przyciemniają jasną ścianę (wiewiórka jest wielokrotnie
-   ciemniejsza); rozjaśnienia i szum są pomijane.
-7. **Filtry regionów.** Zmiany są otaczane prostokątami. Prostokąt jest brany
-   pod uwagę, gdy jego **przekątna > 14 px** (`--min-diagonal-px`), **krótszy
-   bok ≥ 5 px** (odrzuca cienkie drgania krawędzi) i **proporcje ≤ 6:1**
-   (odrzuca długie pasy, np. krawędzie elewacji). Mniejsze obszary są
-   odrzucane.
-8. **Potwierdzenie.** Analizowana jest co 12. klatka (`--frame-step`, 1 próbka na sekundę przy
-   12 kl./s; `1` = każda klatka, wolniej). Pojawienie się wiewiórki jest
-   zgłaszane, gdy w ≥ 2 z ostatnich 4 próbek (przy `--frame-step 1`: ≥ 3 z 5
-   klatek) jest co najmniej jeden taki prostokąt. Początkiem zdarzenia jest
-   pierwsza z tych klatek. Kolejne zdarzenie jest możliwe dopiero po ≥ 1,5 s
-   bez dużego regionu. Skutek rzadszej analizy: bardzo krótkie przeloty
-   (poniżej ok. 2 s) mogą zostać pominięte.
-8a. **Pomiar wielkości dziury (wyłączony).** Detektor liczący ciemne piksele
-    wokół otworu (`OpeningSizeDetector`) jest wyłączony przez
-    `SIZE_DETECTOR_ENABLED = False`, bo zmienne oświetlenie dawało fałszywe
-    zdarzenia. Wiewiórkę wykrywa wyłącznie detektor ruchu.
-    Wyszukiwanie komina i szczytu dachu najpierw sprawdza okolice wzorcowych
-    położeń (±120 px, próg 0,50), co ratuje świt, gdy dopasowanie jest słabe.
-9. **Tryby.** `all` (domyślny) analizuje cały film i zapisuje każde pojawienie się;
-   `first` kończy analizę po pierwszym zdarzeniu.
-10. **Wyniki.** Dla każdego zdarzenia ffmpeg wycina klip od początku zdarzenia
-    (domyślnie 60 s, `--clip-seconds`; krótszy, jeśli film się kończy). Po klipie
-    analiza przeskakuje o tyle samo, więc wiewiórka siedząca dalej przy dziurze
-    daje kolejny klip. Pełny
-    podgląd MP4 powstaje tylko z `--save-preview`; CSV zostaje, gdy było
-    wykrycie (albo z `--save-preview`). Bez wykrycia nie zostaje nic.
-
-Ograniczenia: duża ciemna zmiana przy otworze nie oznacza pewnego rozpoznania
-wiewiórki (może to być np. ptak lub cień), a bardzo jasna wiewiórka na jasnej
-ścianie zostałaby pominięta, bo liczą się tylko obszary ciemniejsze od tła.
+1. **Linie ścian.** Domyślna analiza nie szuka komina ani szczytu dachu. Co
+   sekundę wyznacza na klatce pionową krawędź narożnika i dwie linie granicy
+   koloru ściany, dopasowując każdą z maksymalnie 10 próbek. Każda linia musi
+   mieć co najmniej 5 zgodnych punktów, a błąd dopasowania nie może przekraczać
+   3 px. Środek krzyżyka to średnia przecięć linii pionowej z obiema liniami
+   poziomymi; gdy przecięcia są odległe o ponad 20 px, pomiar jest odrzucany.
+2. **Pola pomiarowe.** Pole testowe ma 10×17 px, z lewym górnym rogiem
+   `(X−12, Y−19)` względem krzyżyka. Pole odniesienia ma ten sam rozmiar,
+   jest 2 px w lewo i 5 pustych pikseli nad polem testowym. Oba pola są
+   mierzone w skali szarości, bez rozmycia i odejmowania tła.
+3. **Sygnał i klip.** Sygnał przekracza próg, gdy
+   `abs(jasność_testu - jasność_odniesienia) / jasność_odniesienia * 100 >= 20%`.
+   Klip powstaje po potwierdzeniu sygnału w co najmniej 2 z 4 kolejnych próbek;
+   jego początek przypada na pierwszą próbkę spełniającą próg. Nakładające się
+   60-sekundowe klipy nie są powielane. `all` zapisuje wszystkie zdarzenia,
+   `first` najwyżej pierwszy klip; oba tryby tworzą pomiar całego nagrania.
+Pomiar linii jest skalibrowany dla widoku `POE_BRAMA` i szuka krawędzi w
+ograniczonych pasach obrazu. Po większym przesunięciu kamery może nie znaleźć
+poprawnej geometrii; błąd będzie widoczny w kolumnie `status` CSV. Przekroczenie
+progu oznacza zmianę jasności, a nie pewne rozpoznanie wiewiórki: wpływać mogą
+też słońce, cień, przesunięcie kamery lub obiekt w polu odniesienia. Każda
+sekundowa próbka jest oceniana; nie ma globalnego uśredniania tła ani odrzucania
+próbek po skoku jasności kamery.
 
 ### Uruchamianie
 
@@ -102,16 +48,15 @@ Przykład dla nagrania z serwera:
 ```
 
 Domyślnie analiza przetwarza cały film i zapisuje wszystkie wykryte pojawienia
-się (`--mode all`). Aby zatrzymać ją po pierwszym wykryciu, użyj `--mode first`. Próg przekątnej można dostroić opcją `--min-diagonal-px`, a
-długość klipu opcją `--clip-seconds`, na przykład:
+się (`--mode all`). Aby zapisać tylko pierwszy klip, użyj `--mode first`.
+Jasnościowy próg można dostroić opcją `--brightness-threshold-percent`
+(domyślnie 20), a długość klipu opcją `--clip-seconds`, na przykład:
 
 ```bash
 ./venv_motion/bin/python -m mcrwac.analysis.squirrel_exit_prototype \
-  /ścieżka/do/nagrania.mkv --mode all --min-diagonal-px 40 --clip-seconds 120
+  /ścieżka/do/nagrania.mkv --mode all \
+  --brightness-threshold-percent 20 --clip-seconds 120
 ```
-
-Pełny film z oznaczeniami (do strojenia; ok. 1,4 GB na 25 min) zapisuje
-dodatkowo `--save-preview`.
 
 Aby przeanalizować wiele nagrań z jednego dnia, użyj `--date` (zamiast pliku) i
 opcjonalnie `--hours`. Bez `--hours` analizowane są wszystkie nagrania z dnia;
@@ -157,14 +102,6 @@ sudo systemctl enable --now squirrel-analysis.service
 journalctl -u squirrel-analysis -f
 ```
 
-Obciążenie (pomiar na VM z 2 rdzeniami, nagranie 30 min, analiza co 4. klatkę,
-tryb `all` z 4 wykrytymi zdarzeniami, przy równoległym obciążeniu maszyny):
-cały przebieg trwał 17,7 min zegarowo (13,4 min czasu procesora), z czego sama
-pętla analizy ok. 5 min, a reszta to cięcie czterech klipów ffmpeg
-(przekodowanie H.264). Kolejka z jednym procesem mieści się więc w czasie
-nagrywania (nowy plik co 30 min), a w trybie `first` powstaje najwyżej jeden klip
-na plik (w domyślnym `all` tyle klipów, ile zdarzeń).
-
 ### Pliki wynikowe
 
 Wszystko trafia domyślnie do podkatalogu z datą nagrania,
@@ -174,9 +111,8 @@ tworzony automatycznie), a nazwy mają postać
 
 | Plik | Nazwa | Zawartość |
 |------|-------|-----------|
-| Podgląd (tylko `--save-preview`) | `<nagranie>_analysis_<czas startu nagrania>.mp4` | cały film: klatki z oznaczonym otworem, obszarem analizy i prostokątami (z przekątną w px); rozdzielczość o połowę mniejsza, kodek mp4v |
-| CSV (gdy było wykrycie lub `--save-preview`) | `<nagranie>_analysis_<czas startu nagrania>.csv` | wiersz na klatkę: `czas_s` (czas w nagraniu źródłowym), `x_otworu`, `y_otworu`, `pewnosc_sledzenia`, `zmieniony_obszar`, `najwieksza_przekatna_px`, `duze_obszary`, `zdarzenie` (`wykryto` w klatce potwierdzenia) |
-| Klip | `<nagranie>_<czas zdarzenia>.mkv` | fragment źródła od początku zdarzenia (domyślnie 60 s), wideo H.264, dźwięk AAC |
+| CSV jasności (zawsze) | `<nagranie>_brightness_<czas startu nagrania>.csv` | tabulatorowy; jeden wiersz na sekundę: krzyżyk, współrzędne obu pól, średnie jasności, różnica ze znakiem i bezwzględna, różnica procentowa, sygnał ≥ progu i zdarzenie potwierdzone |
+| Klip | `<nagranie>_<czas zdarzenia>.mkv` | fragment źródła od pierwszej próbki spełniającej próg (domyślnie 60 s), wideo H.264, dźwięk AAC |
 
 Czas w nazwie (`RRRRMMDDGGMMSS`, np. `20261026133021`) liczony jest z katalogu
 daty i godziny w nazwie pliku (`2026-10-26/13-00-08.mkv`); dla klipu dodatkowo
@@ -184,9 +120,7 @@ o przesunięcie zdarzenia w filmie. Przykład: zdarzenie 30 s po starcie
 `13-00-08.mkv` daje `13-00-08_20261026130038.mkv`. Gdy nazwy nie da się
 odczytać, czas startu wynika z daty modyfikacji pliku. Ponowne analizy nie
 nadpisują wyników — dostają sufiks, np. `_02`. Opcja `--output` wskazuje inną
-bazową ścieżkę (klipy i CSV trafiają wtedy obok niej, z dopisanym czasem).
-Podgląd pomija okresy, gdy otworu szukano, więc bywa krótszy od
-nagrania; CSV zawsze ma czas źródłowy.
+bazową ścieżkę; CSV i klipy trafiają do jej katalogu.
 
 W trybie `--watch` (usługa) po każdym przeanalizowanym nagraniu program skleja klipy dnia
 (`*.mkv` w kolejności czasu) w `result_RRRR_MM_DD.mkv` w tym samym katalogu
