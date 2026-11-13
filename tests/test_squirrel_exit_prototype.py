@@ -15,12 +15,14 @@ from mcrwac.analysis.squirrel_exit_prototype import (
     Appearance,
     AppearanceDetector,
     BrightnessMeasurement,
+    OpeningGeometry,
     _analyze_brightness_video,
     _fit_wall_line,
     _analyzed_list_path,
     _load_analyzed,
     _mark_analyzed,
     _measure_opening_brightness,
+    _opening_geometry_from_measurement,
     _recording_start_time,
     _reserve_output_path,
     _save_appearance_clips,
@@ -109,33 +111,25 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         analyze_brightness_only.assert_called_once()
         self.assertEqual(analyze_brightness_only.call_args.args[0], video_path)
         self.assertEqual(analyze_brightness_only.call_args.args[2], "all")
-        self.assertEqual(analyze_brightness_only.call_args.args[3], 22.0)
+        self.assertEqual(analyze_brightness_only.call_args.args[3], 27.0)
 
-    def test_analysis_rejects_brightness_threshold_below_22_percent(self) -> None:
-        with self.assertRaisesRegex(ValueError, "co najmniej 22%"):
-            analyze_video(Path("recording.mkv"), brightness_threshold_percent=21.9)
+    def test_analysis_rejects_brightness_threshold_below_27_percent(self) -> None:
+        with self.assertRaisesRegex(ValueError, "co najmniej 27%"):
+            analyze_video(Path("recording.mkv"), brightness_threshold_percent=26.9)
 
-    def test_clip_duration_uses_inclusive_detection_tiers(self) -> None:
+    def test_clip_duration_is_three_seconds_for_every_detection_strength(self) -> None:
         for detection_percent, expected_seconds in (
-            (30.1, 12),
-            (30.0, 12),
-            (29.9, 9),
-            (25.1, 9),
-            (25.0, 9),
-            (24.9, 7),
-            (22.0, 7),
+            (0.02, 3),
+            (27.0, 3),
+            (30.0, 3),
+            (100.0, 3),
         ):
             with self.subTest(detection_percent=detection_percent):
                 appearance = Appearance(0, detection_percent)
                 self.assertEqual(appearance.clip_seconds, expected_seconds)
-                self.assertEqual(
-                    appearance.post_detection_seconds, expected_seconds - 2
-                )
+                self.assertEqual(appearance.post_detection_seconds, 2)
 
-        with self.assertRaisesRegex(ValueError, "co najmniej 22%"):
-            Appearance(0, 21.99).clip_seconds
-
-    def test_threshold_accepts_a_measurement_equal_to_22_percent(self) -> None:
+    def test_threshold_accepts_a_measurement_equal_to_27_percent(self) -> None:
         with TemporaryDirectory() as directory:
             xlsx_path = Path(directory) / "measurements.xlsx"
             capture = unittest.mock.MagicMock()
@@ -152,14 +146,14 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                 orange_reference_y=2,
                 upper_reference_x=8,
                 upper_reference_y=-15,
-                test_mean=122.0,
+                test_mean=127.0,
                 reference_mean=100.0,
                 orange_reference_mean=100.0,
                 upper_reference_mean=80.0,
                 reference_source="lower",
-                signed_difference=22.0,
-                absolute_difference=22.0,
-                difference_percent=22.0,
+                signed_difference=27.0,
+                absolute_difference=27.0,
+                difference_percent=27.0,
             )
 
             with patch(
@@ -175,7 +169,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                     fps=1,
                     frame_count=1,
                     recording_start=datetime(2026, 11, 6, 6, 10, 39),
-                    threshold_percent=22,
+                    threshold_percent=27,
                 )
 
             workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
@@ -183,7 +177,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             workbook.close()
 
         self.assertEqual(
-            appearances, [Appearance(start_frame=0, detection_percent=22.0)]
+            appearances, [Appearance(start_frame=0, detection_percent=27.0)]
         )
         self.assertEqual(valid_rows, 1)
         self.assertEqual(invalid_rows, 0)
@@ -201,16 +195,29 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         self.assertAlmostEqual(baseline.upper_reference_mean, 100.0)
         self.assertEqual(baseline.reference_source, "lower")
         self.assertAlmostEqual(baseline.difference_percent, 0.0)
+        self.assertEqual(
+            (baseline.test_x, baseline.test_y),
+            (round(baseline.cross_x - 12), round(baseline.cross_y - 19)),
+        )
 
         dark_test = frame.copy()
         dark_test[
+            baseline.test_y : baseline.test_y + 22,
+            baseline.test_x : baseline.test_x + 12,
+        ] = 50
+        dark_test[
             baseline.test_y : baseline.test_y + 17,
             baseline.test_x : baseline.test_x + 10,
-        ] = 50
-        measurement = _measure_opening_brightness(dark_test)
-        self.assertAlmostEqual(measurement.test_mean, 50.0)
+        ] = 100
+        measurement = _measure_opening_brightness(
+            dark_test, geometry=_opening_geometry_from_measurement(baseline)
+        )
+        expected_mean = (10 * 17 * 100 + (12 * 22 - 10 * 17) * 50) / (12 * 22)
+        self.assertAlmostEqual(measurement.test_mean, expected_mean)
         self.assertAlmostEqual(measurement.reference_mean, 100.0)
-        self.assertAlmostEqual(measurement.difference_percent, 50.0)
+        self.assertAlmostEqual(
+            measurement.difference_percent, abs(expected_mean - 100.0)
+        )
 
     def test_brightness_uses_brighter_reference_rectangle(self) -> None:
         frame = np.full((1296, 2304, 3), 100, dtype=np.uint8)
@@ -218,9 +225,10 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         cv2.line(frame, (278, 752), (340, 752), (20, 20, 20), 2)
         cv2.line(frame, (362, 756), (458, 809), (20, 20, 20), 2)
         baseline = _measure_opening_brightness(frame)
+        clean_frame = frame.copy()
         frame[
-            baseline.test_y : baseline.test_y + 17,
-            baseline.test_x : baseline.test_x + 10,
+            baseline.test_y : baseline.test_y + 22,
+            baseline.test_x : baseline.test_x + 12,
         ] = 120
         frame[
             baseline.orange_reference_y : baseline.orange_reference_y + 17,
@@ -231,7 +239,9 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             baseline.upper_reference_x : baseline.upper_reference_x + 10,
         ] = 150
 
-        measurement = _measure_opening_brightness(frame)
+        measurement = _measure_opening_brightness(
+            frame, geometry=_opening_geometry_from_measurement(baseline)
+        )
 
         self.assertAlmostEqual(measurement.orange_reference_mean, 80.0)
         self.assertAlmostEqual(measurement.upper_reference_mean, 150.0)
@@ -242,7 +252,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
         self.assertAlmostEqual(measurement.difference_percent, 20.0)
 
         transform = np.float32([[1, 0, 20], [0, 1, 15]])
-        shifted = cv2.warpAffine(frame, transform, (2304, 1296))
+        shifted = cv2.warpAffine(clean_frame, transform, (2304, 1296))
         translated = _measure_opening_brightness(shifted, offset_x=20, offset_y=15)
         self.assertAlmostEqual(translated.cross_x, baseline.cross_x + 20, delta=0.1)
         self.assertAlmostEqual(translated.cross_y, baseline.cross_y + 15, delta=0.1)
@@ -271,6 +281,58 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "słaby kontrast"):
             _measure_opening_brightness(frame)
+
+    def test_analysis_reuses_last_geometry_when_current_lines_are_obscured(self) -> None:
+        with TemporaryDirectory() as directory:
+            xlsx_path = Path(directory) / "measurements.xlsx"
+            frame = np.full((1296, 2304, 3), 100, dtype=np.uint8)
+            cv2.line(frame, (355, 680), (346, 825), (220, 220, 220), 2)
+            cv2.line(frame, (278, 752), (340, 752), (20, 20, 20), 2)
+            cv2.line(frame, (362, 756), (458, 809), (20, 20, 20), 2)
+            baseline = _measure_opening_brightness(frame)
+
+            obscured = frame.copy()
+            obscured[675:830, 270:465] = 100
+            obscured[
+                baseline.test_y : baseline.test_y + 22,
+                baseline.test_x : baseline.test_x + 12,
+            ] = 150
+
+            capture = unittest.mock.MagicMock()
+            capture.isOpened.return_value = True
+            capture.read.side_effect = [(True, frame), (True, obscured)]
+
+            with patch(
+                "mcrwac.analysis.squirrel_exit_prototype.cv2.VideoCapture",
+                return_value=capture,
+            ):
+                appearances, valid_rows, invalid_rows = _analyze_brightness_video(
+                    Path("recording.mkv"),
+                    xlsx_path,
+                    fps=1,
+                    frame_count=2,
+                    recording_start=datetime(2026, 11, 6, 6, 10, 39),
+                    threshold_percent=27,
+                )
+
+            workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
+            worksheet = workbook["Pomiary"]
+            self.assertEqual(
+                worksheet["R3"].value,
+                "poprzednia_geometria: zbyt słaby kontrast krawędzi ściany",
+            )
+            self.assertEqual(worksheet["D3"].value, worksheet["D2"].value)
+            self.assertEqual(worksheet["E3"].value, worksheet["E2"].value)
+            self.assertEqual(worksheet["J3"].value, 150.0)
+            self.assertEqual(worksheet["N3"].value, 50.0)
+            self.assertEqual(worksheet["O3"].value, 1)
+            workbook.close()
+
+        self.assertEqual(
+            appearances, [Appearance(start_frame=1, detection_percent=50.0)]
+        )
+        self.assertEqual(valid_rows, 2)
+        self.assertEqual(invalid_rows, 0)
 
     def test_appearance_detector_triggers_on_one_positive_sample(self) -> None:
         detector = AppearanceDetector(fps=10)
@@ -326,7 +388,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                 reference_source="lower",
                 signed_difference=20.0,
                 absolute_difference=20.0,
-                difference_percent=25.0,
+                difference_percent=28.0,
             )
 
             with patch(
@@ -342,7 +404,7 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                     fps=1,
                     frame_count=21,
                     recording_start=datetime(2026, 11, 6, 6, 10, 39),
-                    threshold_percent=22,
+                    threshold_percent=27,
                 )
 
             workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
@@ -353,15 +415,14 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             ]
             workbook.close()
 
-        self.assertEqual(sampled_frames, [0, 7, 14])
-        self.assertEqual(valid_rows, 3)
+        self.assertEqual(sampled_frames, list(range(0, 21, 2)))
+        self.assertEqual(valid_rows, 11)
         self.assertEqual(invalid_rows, 0)
         self.assertEqual(
             appearances,
             [
-                Appearance(start_frame=0, detection_percent=25.0),
-                Appearance(start_frame=7, detection_percent=25.0),
-                Appearance(start_frame=14, detection_percent=25.0),
+                Appearance(start_frame=frame_index, detection_percent=28.0)
+                for frame_index in range(0, 21, 2)
             ],
         )
 
@@ -392,14 +453,32 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
                         fps=2,
                         frame_count=40,
                         recording_start=recording_start,
+                        overlay_geometries={
+                            10: OpeningGeometry(
+                                355.0, 756.0, 343, 738, 341, 716, 341, 699
+                            )
+                        },
                     )
 
         self.assertEqual(clips[0].name, "05-49-02-5-25_05_49_07_36_4pct.mkv")
         self.assertEqual(clips[0].parent, recording_dir)
         command = run.call_args.args[0]
-        self.assertEqual(command[command.index("-ss") + 1], "3.000000")
+        self.assertEqual(command[command.index("-ss") + 1], "4.000000")
         self.assertLess(command.index("-ss"), command.index("-i"))
-        self.assertEqual(command[command.index("-t") + 1], "12.000000")
+        self.assertEqual(command[command.index("-t") + 1], "3.000000")
+        overlay = command[command.index("-vf") + 1]
+        self.assertIn(
+            "drawbox=x=343:y=738:w=12:h=22:color=lime:t=3:enable='lt(t,1)'",
+            overlay,
+        )
+        self.assertIn(
+            "drawbox=x=341:y=755:w=28:h=3:color=yellow:t=fill:enable='lt(t,1)'",
+            overlay,
+        )
+        self.assertIn(
+            "drawbox=x=354:y=742:w=3:h=28:color=yellow:t=fill:enable='lt(t,1)'",
+            overlay,
+        )
         self.assertEqual(command[command.index("-preset") + 1], "ultrafast")
         self.assertEqual(command[command.index("-c:a") + 1], "aac")
         self.assertEqual(command[-2], "-y")
@@ -407,6 +486,49 @@ class SquirrelExitPrototypeTests(unittest.TestCase):
             "Czas zapisu klipu 1/1: 3.25 s "
             "(05-49-02-5-25_05_49_07_36_4pct.mkv)"
         )
+
+    def test_custom_clip_window_uses_merged_start_and_end(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            recording_dir = Path(temp_dir)
+            video_path = recording_dir / "recording.mkv"
+            with patch(
+                "mcrwac.analysis.squirrel_exit_prototype.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ), patch(
+                "mcrwac.analysis.squirrel_exit_prototype.subprocess.run",
+                return_value=type("Result", (), {"returncode": 0, "stderr": ""})(),
+            ) as run, patch(
+                "mcrwac.analysis.squirrel_exit_prototype._time.perf_counter",
+                side_effect=[1.0, 2.0],
+            ), patch(
+                "mcrwac.analysis.squirrel_exit_prototype._log"
+            ):
+                _save_appearance_clips(
+                    video_path,
+                    recording_dir / "preview.mp4",
+                    [
+                        Appearance(
+                            start_frame=20,
+                            detection_percent=10.0,
+                            pre_detection_seconds=6.0,
+                            clip_duration_seconds=7.0,
+                        )
+                    ],
+                    fps=2.0,
+                    frame_count=60,
+                    recording_start=datetime(2026, 11, 12),
+                    overlay_geometries={
+                        20: OpeningGeometry(
+                            355.0, 756.0, 343, 738, 341, 716, 341, 699
+                        )
+                    },
+                    clip_start_seconds={20: 4.0},
+                    clip_end_seconds={20: 11.0},
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-ss") + 1], "4.000000")
+        self.assertEqual(command[command.index("-t") + 1], "7.000000")
 
     def test_output_paths_include_recording_timestamp_and_avoid_collisions(self) -> None:
         with TemporaryDirectory() as temp_dir:

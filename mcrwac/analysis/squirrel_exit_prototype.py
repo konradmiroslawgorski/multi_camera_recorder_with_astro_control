@@ -21,14 +21,16 @@ from openpyxl.styles import Font
 class Appearance:
     start_frame: int
     detection_percent: float
+    pre_detection_seconds: float = 1.0
+    clip_duration_seconds: float = 3.0
 
     @property
     def clip_seconds(self) -> float:
-        return _clip_duration_for_detection(self.detection_percent)
+        return self.clip_duration_seconds
 
     @property
     def post_detection_seconds(self) -> float:
-        return self.clip_seconds - CLIP_PREROLL_SECONDS
+        return self.clip_duration_seconds - self.pre_detection_seconds
 
 
 @dataclass(frozen=True)
@@ -53,11 +55,29 @@ class BrightnessMeasurement:
     difference_percent: float
 
 
+@dataclass(frozen=True)
+class OpeningGeometry:
+    cross_x: float
+    cross_y: float
+    test_x: int
+    test_y: int
+    orange_reference_x: int
+    orange_reference_y: int
+    upper_reference_x: int
+    upper_reference_y: int
+
+
+class _OpeningGeometryError(ValueError):
+    pass
+
+
 DEFAULT_ANALYSIS_OUTPUT_DIR = Path("/opt/cameras/recordings/analysis")
 ANALYSIS_SUBDIR = "POE_BRAMA_wiewiorki"
-DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT = 22.0
+DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT = 27.0
+TEST_FIELD_WIDTH_PX = 12
+TEST_FIELD_HEIGHT_PX = 22
 BRIGHTNESS_SAMPLE_SECONDS = 1.0
-CLIP_PREROLL_SECONDS = 2.0
+CLIP_PREROLL_SECONDS = 1.0
 BRIGHTNESS_MIN_EDGE_GRADIENT = 8.0
 BRIGHTNESS_MAX_LINE_RESIDUAL_PX = 3.0
 BRIGHTNESS_MIN_LINE_POINTS = 5
@@ -68,17 +88,6 @@ ANALYZED_LIST_NAME = "analyzed.txt"
 DEFAULT_RECORDINGS_ROOT = Path("/opt/cameras/recordings")
 DEFAULT_CAMERA = "POE_BRAMA"
 RECORDING_NAME_PATTERN = re.compile(r"^(\d{2})-(\d{2})-(\d{2})\.mkv$")
-
-
-def _clip_duration_for_detection(detection_percent: float) -> float:
-    for level, duration in (
-        (30.0, 12.0),
-        (25.0, 9.0),
-        (22.0, 7.0),
-    ):
-        if detection_percent >= level:
-            return duration
-    raise ValueError("Poziom wykrycia musi wynosić co najmniej 22%.")
 
 
 def _log(message: str, flush: bool = True) -> None:
@@ -173,9 +182,23 @@ def _save_appearance_clips(
     fps: float,
     frame_count: int,
     recording_start: datetime,
+    *,
+    overlay_geometries: dict[int, OpeningGeometry],
+    clip_start_seconds: Optional[dict[int, float]] = None,
+    clip_end_seconds: Optional[dict[int, float]] = None,
 ) -> list[Path]:
     if not appearances:
         return []
+    missing_geometries = [
+        appearance.start_frame
+        for appearance in appearances
+        if appearance.start_frame not in overlay_geometries
+    ]
+    if missing_geometries:
+        raise RuntimeError(
+            "Brak geometrii do oznaczenia klipów dla klatek: "
+            + ", ".join(str(frame) for frame in missing_geometries)
+        )
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("Nie znaleziono ffmpeg wymaganego do zapisu klipów.")
@@ -186,9 +209,26 @@ def _save_appearance_clips(
 
     for clip_index, appearance in enumerate(appearances, start=1):
         detection_seconds = appearance.start_frame / fps
-        start_seconds = max(0.0, detection_seconds - CLIP_PREROLL_SECONDS)
+        start_seconds = max(
+            0.0,
+            (
+                clip_start_seconds.get(
+                    appearance.start_frame,
+                    detection_seconds - appearance.pre_detection_seconds,
+                )
+                if clip_start_seconds is not None
+                else detection_seconds - appearance.pre_detection_seconds
+            ),
+        )
         end_seconds = min(
-            detection_seconds + appearance.post_detection_seconds,
+            (
+                clip_end_seconds.get(
+                    appearance.start_frame,
+                    detection_seconds + appearance.post_detection_seconds,
+                )
+                if clip_end_seconds is not None
+                else detection_seconds + appearance.post_detection_seconds
+            ),
             video_duration,
         )
         duration = end_seconds - start_seconds
@@ -224,21 +264,38 @@ def _save_appearance_clips(
             str(video_path),
             "-t",
             f"{duration:.6f}",
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "20",
-            "-c:a",
-            "aac",
-            "-y",
-            str(clip_path),
         ]
+        overlay_geometry = overlay_geometries[appearance.start_frame]
+        cross_x = round(overlay_geometry.cross_x)
+        cross_y = round(overlay_geometry.cross_y)
+        overlay_filters = (
+            f"drawbox=x={overlay_geometry.test_x}:y={overlay_geometry.test_y}:"
+            f"w={TEST_FIELD_WIDTH_PX}:h={TEST_FIELD_HEIGHT_PX}:"
+            "color=lime:t=3:enable='lt(t,1)'",
+            f"drawbox=x={cross_x - 14}:y={cross_y - 1}:w=28:h=3:"
+            "color=yellow:t=fill:enable='lt(t,1)'",
+            f"drawbox=x={cross_x - 1}:y={cross_y - 14}:w=3:h=28:"
+            "color=yellow:t=fill:enable='lt(t,1)'",
+        )
+        command.extend(["-vf", ",".join(overlay_filters)])
+        command.extend(
+            [
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "20",
+                "-c:a",
+                "aac",
+                "-y",
+                str(clip_path),
+            ]
+        )
         _log(f"Rozpoczynam zapis klipu {clip_index}/{len(appearances)}: {clip_path.name}")
         clip_started = _time.perf_counter()
         try:
@@ -330,10 +387,9 @@ def _wall_intersection(
     return vertical_slope * y + vertical_intercept, y
 
 
-def _measure_opening_brightness(
+def _detect_opening_geometry(
     frame: np.ndarray, offset_x: int = 0, offset_y: int = 0
-) -> BrightnessMeasurement:
-    """Measure grayscale in the test box and use the brighter of two references."""
+) -> OpeningGeometry:
     height, width = frame.shape[:2]
     if height <= 0 or width <= 0:
         raise ValueError("pusta klatka")
@@ -430,10 +486,8 @@ def _measure_opening_brightness(
 
     test_x = round(cross_x - 12)
     test_y = round(cross_y - 19)
-    test_x_end = round(cross_x - 2)
-    test_y_end = round(cross_y - 2)
-    if test_x_end - test_x != 10 or test_y_end - test_y != 17:
-        raise ValueError("nieprawidłowy rozmiar pola testowego")
+    test_x_end = test_x + TEST_FIELD_WIDTH_PX
+    test_y_end = test_y + TEST_FIELD_HEIGHT_PX
     orange_reference_x = test_x - 2
     reference_y_end = test_y - 5
     orange_reference_y = reference_y_end - 17
@@ -452,6 +506,78 @@ def _measure_opening_brightness(
         or upper_reference_y + 17 > height
     ):
         raise ValueError("pole jasności wychodzi poza klatkę")
+
+    return OpeningGeometry(
+        cross_x=cross_x,
+        cross_y=cross_y,
+        test_x=test_x,
+        test_y=test_y,
+        orange_reference_x=orange_reference_x,
+        orange_reference_y=orange_reference_y,
+        upper_reference_x=upper_reference_x,
+        upper_reference_y=upper_reference_y,
+    )
+
+
+def _opening_geometry_from_measurement(
+    measurement: BrightnessMeasurement,
+) -> OpeningGeometry:
+    return OpeningGeometry(
+        cross_x=measurement.cross_x,
+        cross_y=measurement.cross_y,
+        test_x=measurement.test_x,
+        test_y=measurement.test_y,
+        orange_reference_x=measurement.orange_reference_x,
+        orange_reference_y=measurement.orange_reference_y,
+        upper_reference_x=measurement.upper_reference_x,
+        upper_reference_y=measurement.upper_reference_y,
+    )
+
+
+def _measure_opening_brightness(
+    frame: np.ndarray,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    *,
+    geometry: Optional[OpeningGeometry] = None,
+) -> BrightnessMeasurement:
+    """Measure current-frame grayscale using detected or supplied ROI geometry."""
+    height, width = frame.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("pusta klatka")
+    if geometry is None:
+        try:
+            geometry = _detect_opening_geometry(frame, offset_x, offset_y)
+        except ValueError as error:
+            raise _OpeningGeometryError(str(error)) from error
+
+    if (
+        geometry.test_x < 0
+        or geometry.test_y < 0
+        or geometry.test_x + TEST_FIELD_WIDTH_PX > width
+        or geometry.test_y + TEST_FIELD_HEIGHT_PX > height
+        or geometry.orange_reference_x < 0
+        or geometry.orange_reference_y < 0
+        or geometry.orange_reference_x + 10 > width
+        or geometry.orange_reference_y + 17 > height
+        or geometry.upper_reference_x < 0
+        or geometry.upper_reference_y < 0
+        or geometry.upper_reference_x + 10 > width
+        or geometry.upper_reference_y + 17 > height
+    ):
+        raise ValueError("pole jasności wychodzi poza klatkę")
+
+    cross_x = geometry.cross_x
+    cross_y = geometry.cross_y
+    test_x = geometry.test_x
+    test_y = geometry.test_y
+    test_x_end = test_x + TEST_FIELD_WIDTH_PX
+    test_y_end = test_y + TEST_FIELD_HEIGHT_PX
+    orange_reference_x = geometry.orange_reference_x
+    orange_reference_y = geometry.orange_reference_y
+    upper_reference_x = geometry.upper_reference_x
+    upper_reference_y = geometry.upper_reference_y
+    reference_y_end = orange_reference_y + 17
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     test_mean = float(gray[test_y:test_y_end, test_x:test_x_end].mean())
@@ -503,6 +629,37 @@ def _measure_opening_brightness(
     )
 
 
+def _measure_opening_brightness_with_fallback(
+    frame: np.ndarray,
+    last_valid_geometry: Optional[OpeningGeometry],
+    offset_x: int = 0,
+    offset_y: int = 0,
+) -> tuple[Optional[BrightnessMeasurement], Optional[OpeningGeometry], str]:
+    try:
+        measurement = _measure_opening_brightness(frame, offset_x, offset_y)
+    except _OpeningGeometryError as error:
+        if last_valid_geometry is None:
+            return None, None, f"blad_geometrii: {error}"
+        try:
+            measurement = _measure_opening_brightness(
+                frame,
+                offset_x,
+                offset_y,
+                geometry=last_valid_geometry,
+            )
+        except ValueError as fallback_error:
+            return (
+                None,
+                None,
+                f"blad_geometrii: {error}; ponowne użycie poprzedniej geometrii "
+                f"nie powiodło się: {fallback_error}",
+            )
+        return measurement, None, f"poprzednia_geometria: {error}"
+    except ValueError as error:
+        return None, None, f"blad_geometrii: {error}"
+    return measurement, _opening_geometry_from_measurement(measurement), "ok"
+
+
 def _analyze_brightness_video(
     video_path: Path,
     xlsx_path: Path,
@@ -513,6 +670,7 @@ def _analyze_brightness_video(
     offset_x: int = 0,
     offset_y: int = 0,
     mode: str = "all",
+    appearance_geometries: Optional[dict[int, OpeningGeometry]] = None,
 ) -> tuple[list[Appearance], int, int]:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -524,7 +682,9 @@ def _analyze_brightness_video(
     appearances: list[Appearance] = []
     valid_rows = 0
     invalid_rows = 0
+    fallback_rows = 0
     threshold_hits = 0
+    last_valid_geometry: Optional[OpeningGeometry] = None
     headers = [
         "czas_nagrania",
         "czas_s",
@@ -586,11 +746,17 @@ def _analyze_brightness_video(
                 frame_index,
             ]
             threshold_hit = False
-            try:
-                measurement = _measure_opening_brightness(
-                    frame, offset_x, offset_y
+            measurement, detected_geometry, measurement_status = (
+                _measure_opening_brightness_with_fallback(
+                    frame, last_valid_geometry, offset_x, offset_y
                 )
-            except ValueError as error:
+            )
+            if detected_geometry is not None:
+                last_valid_geometry = detected_geometry
+            if measurement_status.startswith("poprzednia_geometria:"):
+                fallback_rows += 1
+
+            if measurement is None:
                 invalid_rows += 1
                 appearance = detector.update(frame_index, False, 0.0)
                 accepted_event = False
@@ -610,7 +776,7 @@ def _analyze_brightness_video(
                         0,
                         int(appearance is not None),
                         int(accepted_event),
-                        f"blad_geometrii: {error}",
+                        measurement_status,
                     ]
                 )
                 row.extend([None] * 7)
@@ -650,7 +816,7 @@ def _analyze_brightness_video(
                         int(threshold_hit),
                         int(appearance is not None),
                         int(accepted_event),
-                        "ok",
+                        measurement_status,
                     ]
                 )
                 row.extend(
@@ -668,6 +834,20 @@ def _analyze_brightness_video(
                         ),
                     ]
                 )
+            if (
+                accepted_event
+                and appearance is not None
+                and appearance_geometries is not None
+            ):
+                if measurement is not None:
+                    appearance_geometries[appearance.start_frame] = (
+                        _opening_geometry_from_measurement(measurement)
+                    )
+                elif last_valid_geometry is not None:
+                    appearance_geometries[appearance.start_frame] = (
+                        last_valid_geometry
+                    )
+
             worksheet.append(row)
 
             sample_advance_frames = sample_step_frames
@@ -718,8 +898,9 @@ def _analyze_brightness_video(
 
     _log(
         f"Jasność test/odniesienie: {xlsx_path}; próbki {valid_rows}, "
-        f"błędy geometrii {invalid_rows}, sygnały >= {threshold_percent:.1f}%: "
-        f"{threshold_hits}, potwierdzone klipy: {len(appearances)}."
+        f"poprzednia geometria {fallback_rows}, błędy pomiaru {invalid_rows}, "
+        f"sygnały >= {threshold_percent:.1f}%: {threshold_hits}, "
+        f"potwierdzone klipy: {len(appearances)}."
     )
     return appearances, valid_rows, invalid_rows
 
@@ -749,6 +930,7 @@ def _analyze_brightness_only(
             f"{video_path.stem}_brightness_{recording_start:%Y%m%d%H%M%S}.xlsx"
         )
     )
+    appearance_geometries: dict[int, OpeningGeometry] = {}
     appearances, _, _ = _analyze_brightness_video(
         video_path,
         brightness_xlsx_path,
@@ -757,6 +939,7 @@ def _analyze_brightness_only(
         recording_start,
         threshold_percent,
         mode=mode,
+        appearance_geometries=appearance_geometries,
     )
     clip_paths = _save_appearance_clips(
         video_path,
@@ -765,6 +948,7 @@ def _analyze_brightness_only(
         fps,
         frame_count,
         recording_start,
+        overlay_geometries=appearance_geometries,
     )
     _log(f"Wyniki jasności: {brightness_xlsx_path}")
     if clip_paths:
@@ -789,7 +973,7 @@ def analyze_video(
         or brightness_threshold_percent < DEFAULT_BRIGHTNESS_THRESHOLD_PERCENT
     ):
         raise ValueError(
-            "Próg jasności musi być skończoną wartością co najmniej 22%."
+            "Próg jasności musi być skończoną wartością co najmniej 27%."
         )
     return _analyze_brightness_only(
         video_path,
@@ -857,8 +1041,26 @@ def _mark_analyzed(
 ) -> None:
     list_path = _analyzed_list_path(video_path, analysis_dir, subdir)
     list_path.parent.mkdir(parents=True, exist_ok=True)
-    with list_path.open("a", encoding="utf-8") as list_file:
-        list_file.write(f"{video_path.name}\t{status}\n")
+    try:
+        lines = list_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+
+    updated = False
+    new_lines: list[str] = []
+    for line in lines:
+        if line.partition("\t")[0] == video_path.name:
+            if not updated:
+                new_lines.append(f"{video_path.name}\t{status}")
+                updated = True
+        else:
+            new_lines.append(line)
+    if not updated:
+        new_lines.append(f"{video_path.name}\t{status}")
+
+    temporary_path = list_path.with_suffix(".txt.tmp")
+    temporary_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    temporary_path.replace(list_path)
 
 
 def day_result_path(day_directory: Path) -> Path:

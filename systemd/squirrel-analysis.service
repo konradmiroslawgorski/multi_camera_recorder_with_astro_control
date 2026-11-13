@@ -1,12 +1,12 @@
 [Unit]
-Description=Analiza wyjscia wiewiorki (POE_BRAMA), kazde zakonczone nagranie
+Description=Analiza zmian jasnosci wiewiorki (POE_BRAMA), N=1 P=0.05, N=4 P=0.1
 After=local-fs.target
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/projects/mcrwac
-ExecStart=/home/ubuntu/projects/mcrwac/venv_motion/bin/python -m mcrwac.analysis.squirrel_exit_prototype --watch --from-date 2026-11-05
+ExecStart=/home/ubuntu/projects/mcrwac/venv_motion/bin/python -m mcrwac.analysis.squirrel_brightness_tests --watch --from-date 2026-11-11 --n 1 4 --p 0.05 0.1 --analysis-root /opt/cameras/recordings/analysis
 Restart=always
 RestartSec=30
 TimeoutStopSec=30
