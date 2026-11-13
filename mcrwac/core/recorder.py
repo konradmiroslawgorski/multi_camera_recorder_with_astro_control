@@ -32,6 +32,17 @@ def _next_start(now: datetime, window: RecordingWindow) -> datetime:
     return window.get_window(next_day)[2]
 
 
+def _recording_bounds(
+    now: datetime, window: RecordingWindow, always: bool
+) -> tuple[datetime, datetime]:
+    if always:
+        start = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
+        end = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=now.tzinfo)
+        return start, end
+    _, _, start, end = window.get_window(now)
+    return start, end
+
+
 # Kamera z dwoma obrazami w jednej klatce: po przycięciu do dolnej połowy znika jej
 # zegar, więc czas serwera jest wypalany w lewym dolnym rogu (zamiast napisu CAMO1).
 TIMESTAMP_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
@@ -56,7 +67,7 @@ def _ffmpeg_command(
         "+genpts",
         "-rtsp_transport",
         "tcp",
-        "-stimeout",
+        "-timeout",
         "5000000",
         "-i",
         rtsp_url,
@@ -230,6 +241,7 @@ def main() -> None:
     rtsp_url = os.environ["RTSP_URL"]
     segment_time = os.environ["SEGMENT_TIME"]
     pre_crop = os.environ.get("PRE_CROP", "")
+    always = os.environ.get("MCRWAC_RECORDING_ALWAYS") == "1"
 
     project_dir = Path(__file__).resolve().parents[2]
     config_path = Path(
@@ -243,7 +255,9 @@ def main() -> None:
     notifications = window.config.get("notifications") or {}
     start_timeout = float(notifications.get("start_timeout_seconds", 60))
     notifier = build_notifier(window.config, camera, window.timezone, config_path.parent)
-    logger.info("Recorder started for %s using %s", camera, config_path)
+    logger.info(
+        "Recorder started for %s using %s (always=%s)", camera, config_path, always
+    )
 
     def send_status(state: str) -> None:
         notifier.status(
@@ -257,7 +271,7 @@ def main() -> None:
 
     while not stop_requested.is_set():
         now = datetime.now(timezone)
-        _, _, start, end = window.get_window(now)
+        start, end = _recording_bounds(now, window, always)
 
         if not start <= now < end:
             window_opened_by_astro = True
@@ -314,12 +328,14 @@ def main() -> None:
                 tags="black_square_for_stop",
             )
         else:
+            reason = "koniec dnia" if always else "koniec okna"
             notifier.event(
-                f"stop nagrywania filmu [{last_file}] (koniec okna)",
+                f"stop nagrywania filmu [{last_file}] ({reason})",
                 title="Stop",
                 tags="black_square_for_stop",
             )
-            send_status("status wieczorny: nagrywanie zatrzymane wg astro")
+            if not always:
+                send_status("status wieczorny: nagrywanie zatrzymane wg astro")
 
         if not stop_requested.is_set() and datetime.now(timezone) < end:
             logger.info("Retrying FFmpeg for %s in 5 seconds", camera)

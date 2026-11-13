@@ -8,7 +8,7 @@ Rejestrator działa na maszynie wirtualnej z Ubuntu. Zanim zaczniesz pracę
 (wdrożenie, restart usług, podgląd logów), **uruchom VM serwera**:
 
 - adres IP: `192.168.196.10`
-- użytkownik: ubuntu, hasło: kcb
+- użytkownik: ubuntu
 - alias SSH: `ubuntu-mv` (wpis w lokalnym pliku `.ssh/config` na Windowsie,
   zwykle `C:\Users\<użytkownik>\.ssh\config`)
 
@@ -34,6 +34,22 @@ Zainstaluj wymagane zależności Pythona w środowisku `venv_motion` poleceniem
 `venv_motion/bin/pip install -r requirements.txt`. Po zmianie konfiguracji
 zrestartuj usługi kamer, na przykład:
 `sudo systemctl restart camera@POE1 camera@POE_BRAMA`.
+
+Do tymczasowego nagrywania całodobowego, bez okna Astro:
+
+```bash
+sudo systemctl set-environment MCRWAC_RECORDING_ALWAYS=1
+sudo systemctl restart camera@POE1 camera@POE_BRAMA
+```
+
+Ustawienie działa do ponownego uruchomienia systemu lub jego usunięcia. Aby
+wrócić do okna Astro, wykonaj `sudo systemctl unset-environment
+MCRWAC_RECORDING_ALWAYS` i zrestartuj obie usługi kamer. W trybie całodobowym
+rejestrator kończy i rozpoczyna nagrywanie o północy, aby tworzyć katalogi dat.
+
+Na Ubuntu 26.04 (Python 3.14) wymagane są pakiety systemowe `python3.14-venv`,
+`ffmpeg` i `libgl1`. Plik `requirements.txt` dobiera NumPy 2.3.2 dla Pythona
+3.14; dla starszych wersji pozostaje NumPy 2.2.6.
 
 ## Eksperymentalna analiza wyjścia wiewiórki
 

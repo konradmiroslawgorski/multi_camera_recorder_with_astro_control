@@ -1,4 +1,6 @@
-numpy==2.2.6
+# NumPy 2.2.6 predates Python 3.14 wheels.
+numpy==2.2.6; python_version < "3.14"
+numpy==2.3.2; python_version >= "3.14"
 opencv-python==4.13.0.92
 astral==3.2
 PyYAML==6.0.3

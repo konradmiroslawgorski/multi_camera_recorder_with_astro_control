@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from mcrwac.core.recorder import _ffmpeg_command, _next_start
+from mcrwac.core.recorder import _ffmpeg_command, _next_start, _recording_bounds
 from mcrwac.core.time_window import RecordingWindow
 
 
@@ -45,6 +45,22 @@ class RecordingWindowTests(unittest.TestCase):
         self.assertEqual(next_start.date().isoformat(), "2026-07-16")
         self.assertEqual(next_start.tzinfo, ZoneInfo("Europe/Warsaw"))
 
+    def test_always_mode_uses_local_day_including_dst_change(self) -> None:
+        now = datetime(2026, 3, 29, 12, tzinfo=ZoneInfo("Europe/Warsaw"))
+
+        start, end = _recording_bounds(now, self.window, always=True)
+
+        self.assertEqual(start.isoformat(), "2026-03-29T00:00:00+01:00")
+        self.assertEqual(end.isoformat(), "2026-03-30T00:00:00+02:00")
+
+    def test_normal_mode_preserves_astronomical_window(self) -> None:
+        now = datetime(2026, 7, 15, 12, tzinfo=ZoneInfo("Europe/Warsaw"))
+
+        self.assertEqual(
+            _recording_bounds(now, self.window, always=False),
+            self.window.get_window(now)[2:],
+        )
+
     def test_ffmpeg_command_preserves_camera_crop_settings(self) -> None:
         command = _ffmpeg_command(
             "rtsp://camera/stream",
@@ -58,6 +74,7 @@ class RecordingWindowTests(unittest.TestCase):
         self.assertIn("drawtext", video_filter)
         self.assertIn("libx264", command)
         self.assertEqual(command[command.index("-segment_time") + 1], "1800")
+        self.assertEqual(command[command.index("-timeout") + 1], "5000000")
         self.assertEqual(command[-1], "/recordings/%Y-%m-%d/%H-%M-%S.mkv")
 
     def test_ffmpeg_command_without_crop_copies_streams_untouched(self) -> None:

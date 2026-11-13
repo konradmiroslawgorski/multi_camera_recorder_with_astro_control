@@ -179,35 +179,37 @@ nie jest kompletną, zweryfikowaną dokumentacją techniczną.
 
 ## Zależności i sprawdzenie
 
-Środowiskiem projektu jest `venv_motion` (Python 3.10.12 w chwili
-weryfikacji). `requirements.txt` przypina:
+Środowiskiem projektu jest `venv_motion`. Pełny zestaw 79 testów przechodził
+na Pythonie 3.10.12 oraz 3.14.4. `requirements.txt` przypina:
 
-- NumPy 2.2.6,
+- NumPy 2.2.6 dla Pythona <3.14 oraz 2.3.2 dla Pythona >=3.14,
 - OpenCV Python 4.13.0.92,
 - Astral 3.2,
 - PyYAML 6.0.3.
 
-Analiza klipów wymaga systemowego `ffmpeg`; analiza POE1 korzysta także
-z `ffprobe`. W chwili weryfikacji oba narzędzia były dostępne.
+Na Ubuntu 26.04 wymagane są także systemowe `ffmpeg`, `ffprobe` i `libgl1`
+(biblioteka `libGL.so.1`, używana przez OpenCV).
 
-Testy wspólne i analizatora wiewiórek:
+Pełny zestaw testów:
 
 ```bash
-./venv_motion/bin/python -m unittest \
-  tests.test_squirrel_exit_prototype tests.test_notifier tests.test_time_window
+./venv_motion/bin/python -m unittest discover -s tests
 ```
 
-Weryfikacja w tej sesji: 35 testów zakończonych wynikiem `OK`; `--help`
-analizatora wiewiórek pokazuje wyłącznie opcje aktualnego pomiaru jasności,
-wyboru nagrań, trybu i obsługi kolejki. Testy POE1 są w
-`tests/test_poe1_bird_motion.py`.
+Weryfikacja: 79 testów zakończonych wynikiem `OK` na Pythonie 3.10.12
+i 3.14.4. Nie ma skonfigurowanej macierzy CI dla innych wersji Pythona.
 
 ## Bieżący stan operacyjny i nierozstrzygnięte pozycje
 
+- 2026-11-14 po 00:34 przywrócono okno Astro po nocnym teście obu kamer.
+  Obie usługi kamer i obie usługi analizy są aktywne i włączone przy starcie
+  systemu. Kamery oczekują na początek okna o 05:54:58 czasu lokalnego.
+  Tymczasowy tryb całodobowy jest wyłączony.
+- Aktualna jednostka `squirrel-analysis` używa `--n 1 4 --p 0.05 0.1`;
+  opis parametrów N=7 i P=0.1 w pozostałej części dokumentu jest nieaktualny.
 - Obie usługi rejestratorów (`camera@POE1`, `camera@POE_BRAMA`) były aktywne
-  podczas sprawdzenia. Usługi `squirrel-analysis` i
-  `poe1-sikorki-analysis` były nieaktywne; nie działał proces analizatora
-  wiewiórek. Nie uruchamiać ich bez osobnej decyzji.
+  podczas wcześniejszego sprawdzenia. Wtedy usługi `squirrel-analysis` i
+  `poe1-sikorki-analysis` były nieaktywne.
 - Ograniczona walidacja geometrii wiewiórek na 30 próbkach minutowych
   zakończyła się poprawnie. Podgląd pięciu przykładowych klatek znajduje się
   poza repozytorium w
