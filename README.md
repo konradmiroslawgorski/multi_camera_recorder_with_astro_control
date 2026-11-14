@@ -77,8 +77,14 @@ Zdarzenia:
 - **status** (konfiguracja + dane astro: wschód, zachód, okno, z adnotacją „astro OK"):
   tylko rano po starcie nagrywania otwartym przez astro i wieczorem po zatrzymaniu
   na końcu okna. Restart usługi lub nagrywania w ciągu dnia nie wysyła statusu,
-- **błędy** (nieoczekiwane wyjście FFmpeg, brak nowego pliku): pierwszy od razu,
-  kolejne w ciągu godziny (`error_group_minutes`) w jednym zbiorczym powiadomieniu.
+- **błędy nagrywania**: rejestrator restartuje FFmpeg, jeśli przez
+  `start_timeout_seconds` (domyślnie 60 s) nie powstanie pierwszy plik lub
+  żaden segment nie przyrasta. Reaguje także na nieoczekiwane wyjście FFmpeg.
+  Pierwsze trzy kolejne awarie bez przyrostu pliku są zgłaszane osobno.
+  Po trzeciej próby wznowienia trwają, a kolejne awarie są podsumowywane po
+  5 minutach, następnie po 15 i 30 minutach od poprzedniego podsumowania,
+  a później co godzinę. Przyrost pliku resetuje licznik i kończy tryb awaryjny;
+  po wyjściu z tego trybu wysyłane jest powiadomienie o wznowieniu.
 
 Konfiguracja: sekcja `notifications` w `config/recording_config.yaml`. Nazwa tematu
 działa jak hasło (publiczny serwer), więc nie trzymamy jej w repozytorium:

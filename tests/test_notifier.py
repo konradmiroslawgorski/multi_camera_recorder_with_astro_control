@@ -1,9 +1,12 @@
 import os
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
 from mcrwac.core import recorder
@@ -127,7 +130,7 @@ class RecordUntilTests(unittest.TestCase):
         recorder.stop_requested.clear()
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
-            script = f"touch {out}/10-00-00.mkv; sleep 1.2; touch {out}/10-30-00.mkv; sleep 30"
+            script = f"printf x > {out}/10-00-00.mkv; sleep 1.2; printf x > {out}/10-30-00.mkv; sleep 30"
             seen: list[str] = []
             end = datetime.now(ZoneInfo("Europe/Warsaw")) + timedelta(seconds=3)
 
@@ -161,21 +164,128 @@ class RecordUntilTests(unittest.TestCase):
 
         self.assertFalse(result.exited_unexpectedly)
 
-    def test_no_file_callback_after_timeout(self) -> None:
+    def test_stops_ffmpeg_if_first_file_never_appears(self) -> None:
         recorder.stop_requested.clear()
         with tempfile.TemporaryDirectory() as tmp:
-            end = datetime.now(ZoneInfo("Europe/Warsaw")) + timedelta(seconds=3)
-            fired: list[bool] = []
+            end = datetime.now(ZoneInfo("Europe/Warsaw")) + timedelta(seconds=10)
             result = recorder._record_until(
                 end,
-                ["bash", "-c", "sleep 30"],
+                [sys.executable, "-c", "import time; time.sleep(30)"],
                 Path(tmp),
                 start_timeout=1,
-                on_no_file=lambda: fired.append(True),
             )
 
-        self.assertEqual(fired, [True])
-        self.assertTrue(result.no_file_created)
+        self.assertTrue(result.stalled)
+        self.assertIsNone(result.first_file)
+        self.assertIsNotNone(result.returncode)
+
+    def test_stops_ffmpeg_after_file_growth_and_segment_rotation_stop(self) -> None:
+        recorder.stop_requested.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            script = (
+                "import pathlib, signal, sys, time; "
+                "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); "
+                f"p = pathlib.Path({str(out)!r}); "
+                "(p / '10-00-00.mkv').write_bytes(b'a'); time.sleep(1.2); "
+                "(p / '10-30-00.mkv').write_bytes(b'b'); time.sleep(30)"
+            )
+            progress: list[bool] = []
+            seen: list[str] = []
+            end = datetime.now(ZoneInfo("Europe/Warsaw")) + timedelta(seconds=10)
+            started = time.monotonic()
+            result = recorder._record_until(
+                end, [sys.executable, "-c", script], out, 2, seen.append,
+                lambda: progress.append(True),
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertTrue(result.stalled)
+        self.assertGreaterEqual(elapsed, 3.5)
+        self.assertEqual(seen, ["10-00-00.mkv"])
+        self.assertEqual(result.last_file, "10-30-00.mkv")
+        self.assertEqual(progress, [True])
+
+    def test_progress_is_detected_even_when_ffmpeg_exits_quickly(self) -> None:
+        recorder.stop_requested.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "import pathlib, sys; "
+                f"pathlib.Path({str(Path(tmp) / 'recording.mkv')!r}).write_bytes(b'x'); "
+                "sys.exit(3)"
+            )
+            progress: list[bool] = []
+            end = datetime.now(ZoneInfo("Europe/Warsaw")) + timedelta(seconds=10)
+            result = recorder._record_until(
+                end, [sys.executable, "-c", script], Path(tmp),
+                on_progress=lambda: progress.append(True),
+            )
+
+        self.assertTrue(result.exited_unexpectedly)
+        self.assertEqual(progress, [True])
+
+    def test_empty_file_is_not_recording_progress(self) -> None:
+        recorder.stop_requested.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "import pathlib, time; "
+                f"pathlib.Path({str(Path(tmp) / 'empty.mkv')!r}).touch(); "
+                "time.sleep(30)"
+            )
+            progress: list[bool] = []
+            end = datetime.now(ZoneInfo("Europe/Warsaw")) + timedelta(seconds=10)
+            result = recorder._record_until(
+                end, [sys.executable, "-c", script], Path(tmp), 2,
+                on_progress=lambda: progress.append(True),
+            )
+
+        self.assertTrue(result.stalled)
+        self.assertIsNone(result.first_file)
+        self.assertEqual(progress, [])
+
+
+class FailureNotificationTests(unittest.TestCase):
+    def test_emergency_escalation_and_recovery(self) -> None:
+        clock = FakeClock()
+        notifier = Mock()
+        failures = recorder.FailureNotifications(notifier, clock)
+
+        for _ in range(3):
+            failures.failure("brak nagrania")
+        self.assertEqual(notifier.event.call_count, 3)
+        self.assertIn("tryb awaryjny", notifier.event.call_args.args[0])
+
+        for deadline in (300, 1200, 3000, 6600, 10200):
+            failures.failure("brak nagrania")
+            clock.now = deadline - 1
+            previous = notifier.event.call_count
+            failures.tick()
+            self.assertEqual(notifier.event.call_count, previous)
+            clock.now = deadline
+            failures.tick()
+            self.assertEqual(notifier.event.call_count, previous + 1)
+            self.assertIn("1 kolejnych awarii", notifier.event.call_args.args[0])
+
+        failures.failure("brak nagrania")
+        failures.progress()
+        self.assertIn("nagrywanie wznowione", notifier.event.call_args.args[0])
+        self.assertIn("1 od ostatniego powiadomienia", notifier.event.call_args.args[0])
+        count = notifier.event.call_count
+        clock.now += 4000
+        failures.tick()
+        self.assertEqual(notifier.event.call_count, count)
+        failures.failure("nowa awaria")
+        self.assertIn("awaria 1:", notifier.event.call_args.args[0])
+
+    def test_progress_before_emergency_resets_failure_count(self) -> None:
+        notifier = Mock()
+        failures = recorder.FailureNotifications(notifier, FakeClock())
+        failures.failure("pierwsza")
+        failures.failure("druga")
+        failures.progress()
+        failures.failure("nowa")
+        self.assertEqual(notifier.event.call_count, 3)
+        self.assertIn("awaria 1:", notifier.event.call_args.args[0])
 
 
 class StatusTextTests(unittest.TestCase):

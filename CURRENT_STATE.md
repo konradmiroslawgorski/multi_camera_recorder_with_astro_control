@@ -18,6 +18,10 @@ przycinana do dolnej połowy, z czasem serwera wypalonym w obrazie; `POE1` jest
 kopiowana bez tego przycięcia. Powiadomienia ntfy są opcjonalne i nie są
 warunkiem nagrywania.
 
+Rejestratory nadzorują przyrost plików i restartują FFmpeg po 60 s bez
+zapisu, także gdy pierwszy plik nie powstanie. Po trzech kolejnych awariach
+bez przyrostu ograniczają częstotliwość powiadomień; szczegóły są w README.
+
 Analizatory działają oddzielnie od rejestratorów. Każdy może analizować
 pojedyncze nagranie, datę lub działać jako obserwująca kolejkę usługa `--watch`.
 Nie należy utożsamiać algorytmów POE1 i POE_BRAMA: detektor wiewiórek używa

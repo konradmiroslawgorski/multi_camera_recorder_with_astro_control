@@ -11,7 +11,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from mcrwac.core.time_window import RecordingWindow
-from mcrwac.notify import build_notifier
+from mcrwac.notify import Notifier, build_notifier
 
 
 logger = logging.getLogger("camera-recorder")
@@ -140,11 +140,72 @@ class RecordingResult:
     exited_unexpectedly: bool = False
     first_file: Optional[str] = None
     last_file: Optional[str] = None
-    no_file_created: bool = False
+    stalled: bool = False
 
 
-def _list_segments(output_dir: Path) -> set[str]:
-    return {path.name for path in output_dir.glob("*.mkv")}
+def _segment_sizes(output_dir: Path) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    for path in output_dir.glob("*.mkv"):
+        try:
+            sizes[path.name] = path.stat().st_size
+        except FileNotFoundError:
+            continue
+    return sizes
+
+
+class FailureNotifications:
+    intervals = (5 * 60, 15 * 60, 30 * 60, 60 * 60)
+
+    def __init__(self, notifier: Notifier, clock: Callable[[], float] = monotonic) -> None:
+        self.notifier = notifier
+        self.clock = clock
+        self.failures = 0
+        self.pending = 0
+        self.interval_index = 0
+        self.next_notice: Optional[float] = None
+        self.last_error = ""
+
+    def _send(self, text: str) -> None:
+        self.notifier.event(text, title="Blad", priority="high", tags="warning")
+
+    def failure(self, text: str) -> None:
+        logger.error("%s", text)
+        self.failures += 1
+        self.last_error = text
+        if self.failures <= 3:
+            message = f"awaria {self.failures}: {text}"
+            if self.failures == 3:
+                message += "; tryb awaryjny, proby wznowienia trwaja"
+                self.next_notice = self.clock() + self.intervals[0]
+            self._send(message)
+        else:
+            self.pending += 1
+        self.tick()
+
+    def tick(self) -> None:
+        if self.next_notice is None or self.clock() < self.next_notice:
+            return
+        self._send(
+            f"tryb awaryjny: {self.pending} kolejnych awarii od ostatniego "
+            f"powiadomienia, lacznie {self.failures}; ostatnia: {self.last_error}"
+        )
+        self.pending = 0
+        self.interval_index = min(self.interval_index + 1, len(self.intervals) - 1)
+        self.next_notice = self.clock() + self.intervals[self.interval_index]
+
+    def progress(self) -> None:
+        if self.failures >= 3:
+            self.notifier.event(
+                f"nagrywanie wznowione po {self.failures} awariach "
+                f"({self.pending} od ostatniego powiadomienia)",
+                title="Wznowiono",
+            )
+            logger.info("Recording recovered after %s failures", self.failures)
+        self.failures = 0
+        self.pending = 0
+        self.interval_index = 0
+        self.next_notice = None
+        self.last_error = ""
 
 
 def _record_until(
@@ -153,11 +214,12 @@ def _record_until(
     output_dir: Path,
     start_timeout: float = 60,
     on_first_file: Optional[Callable[[str], None]] = None,
-    on_no_file: Optional[Callable[[], None]] = None,
+    on_progress: Optional[Callable[[], None]] = None,
+    on_poll: Optional[Callable[[], None]] = None,
 ) -> RecordingResult:
     result = RecordingResult()
-    known = _list_segments(output_dir)
-    started = monotonic()
+    known = _segment_sizes(output_dir)
+    last_progress = monotonic()
     process = subprocess.Popen(command)
     try:
         while not stop_requested.is_set():
@@ -169,32 +231,39 @@ def _record_until(
                 result.returncode = process.wait(timeout=min(remaining, 1))
             except subprocess.TimeoutExpired:
                 result.returncode = None
-            else:
-                # systemd wysyła SIGTERM do całej grupy, więc FFmpeg może
-                # zakończyć się zanim nasz handler ustawi stop_requested.
-                if not stop_requested.wait(1):
+
+            if on_poll:
+                on_poll()
+            sizes = _segment_sizes(output_dir)
+            new_files = sorted(sizes.keys() - known.keys())
+            if new_files:
+                result.last_file = new_files[-1]
+            growing = sorted(
+                name for name, size in sizes.items() if size > known.get(name, 0)
+            )
+            if growing:
+                last_progress = monotonic()
+                result.last_file = growing[-1]
+                if result.first_file is None:
+                    result.first_file = growing[0]
+                    if on_progress:
+                        on_progress()
+                    if on_first_file:
+                        on_first_file(result.first_file)
+            known = sizes
+            if result.returncode is not None:
+                # FFmpeg może zakończyć się przed odebraniem SIGTERM przez rejestrator.
+                if not stop_requested.wait(1) and datetime.now(end.tzinfo) < end:
                     result.exited_unexpectedly = True
                     logger.warning(
                         "FFmpeg exited unexpectedly with status %s", result.returncode
                     )
                 break
-
-            new_files = sorted(_list_segments(output_dir) - known)
-            if new_files:
-                known.update(new_files)
-                result.last_file = new_files[-1]
-                if result.first_file is None:
-                    result.first_file = new_files[0]
-                    if on_first_file:
-                        on_first_file(result.first_file)
-            elif (
-                result.first_file is None
-                and not result.no_file_created
-                and monotonic() - started > start_timeout
-            ):
-                result.no_file_created = True
-                if on_no_file:
-                    on_no_file()
+            if stop_requested.is_set() or datetime.now(end.tzinfo) >= end:
+                break
+            if monotonic() - last_progress >= start_timeout:
+                result.stalled = True
+                break
     finally:
         _stop_ffmpeg(process, already_signalled=stop_requested.is_set())
 
@@ -202,13 +271,9 @@ def _record_until(
         result.returncode = process.returncode
 
     # Segment utworzony tuż przed zatrzymaniem FFmpeg.
-    new_files = sorted(_list_segments(output_dir) - known)
+    new_files = sorted(_segment_sizes(output_dir).keys() - known.keys())
     if new_files:
         result.last_file = new_files[-1]
-        if result.first_file is None:
-            result.first_file = new_files[0]
-            if on_first_file:
-                on_first_file(result.first_file)
     return result
 
 
@@ -254,7 +319,10 @@ def main() -> None:
     base_dir = Path("/opt/cameras/recordings") / camera
     notifications = window.config.get("notifications") or {}
     start_timeout = float(notifications.get("start_timeout_seconds", 60))
+    if not 0 < start_timeout < float("inf"):
+        raise ValueError("notifications.start_timeout_seconds must be finite and positive")
     notifier = build_notifier(window.config, camera, window.timezone, config_path.parent)
+    failures = FailureNotifications(notifier)
     logger.info(
         "Recorder started for %s using %s (always=%s)", camera, config_path, always
     )
@@ -306,26 +374,27 @@ def main() -> None:
             if send_morning_status:
                 send_status("status poranny: nagrywanie wystartowalo wg astro")
 
-        def on_no_file() -> None:
-            notifier.error(
-                f"FFmpeg dziala, ale od {start_timeout:.0f}s nie powstal zaden plik .mkv"
-            )
-
         result = _record_until(
-            end, command, output_dir, start_timeout, on_first_file, on_no_file
+            end, command, output_dir, start_timeout, on_first_file,
+            failures.progress, failures.tick,
         )
 
         last_file = result.last_file or "brak pliku"
-        if result.exited_unexpectedly:
-            notifier.error(
-                f"FFmpeg zakonczyl prace nieoczekiwanie (kod {result.returncode}), "
-                f"ostatni plik [{last_file}]"
-            )
-        elif stop_requested.is_set():
+        if stop_requested.is_set():
             notifier.event(
                 f"stop nagrywania filmu [{last_file}] (zatrzymanie uslugi)",
                 title="Stop",
                 tags="black_square_for_stop",
+            )
+        elif result.stalled:
+            failures.failure(
+                f"brak przyrostu nagrania przez {start_timeout:.0f}s, "
+                f"restart FFmpeg; ostatni plik [{last_file}]"
+            )
+        elif result.exited_unexpectedly:
+            failures.failure(
+                f"FFmpeg zakonczyl prace nieoczekiwanie (kod {result.returncode}), "
+                f"ostatni plik [{last_file}]"
             )
         else:
             reason = "koniec dnia" if always else "koniec okna"
@@ -340,6 +409,7 @@ def main() -> None:
         if not stop_requested.is_set() and datetime.now(timezone) < end:
             logger.info("Retrying FFmpeg for %s in 5 seconds", camera)
             stop_requested.wait(5)
+            failures.tick()
 
     logger.info("Recorder stopped for %s", camera)
     notifier.close()

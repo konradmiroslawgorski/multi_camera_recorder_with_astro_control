@@ -12,7 +12,7 @@ segment:
 
 notifications:
   error_group_minutes: 60
-  start_timeout_seconds: 60
+  start_timeout_seconds: 60  # Również maksymalny czas bez przyrostu nagrania.
   ntfy:
     enabled: true
     server: https://ntfy.sh
